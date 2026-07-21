@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 def embedding(token_ids, embed_weight):
     embed_tokens = embed_weight[token_ids]
@@ -29,3 +30,52 @@ def rotate_half(x):
 
 def apply_rope(x, cos, sin):
     return (x * cos) + (rotate_half(x) * sin)
+
+def attention(x, weights, layer_idx, config):
+    num_heads = config.num_attention_heads
+    head_dim = config.head_dim
+    num_kv_heads = config.num_key_value_heads
+    batch_size, seq_len, hidden_size = x.size()
+
+    q = F.linear(
+        x,
+        weights[f"model.layers.{layer_idx}.self_attn.q_proj.weight"],
+        weights[f"model.layers.{layer_idx}.self_attn.q_proj.bias"]
+        )
+    k = F.linear(
+        x,
+        weights[f"model.layers.{layer_idx}.self_attn.k_proj.weight"],
+        weights[f"model.layers.{layer_idx}.self_attn.k_proj.bias"]
+        )
+    v = F.linear(
+        x,
+        weights[f"model.layers.{layer_idx}.self_attn.v_proj.weight"],
+        weights[f"model.layers.{layer_idx}.self_attn.v_proj.bias"]
+        )
+    q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+    v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+
+    cos, sin = rope_tables(seq_len, head_dim, config.rope_theta)
+    q = apply_rope(q, cos, sin)
+    k = apply_rope(k, cos, sin)
+
+    n_rep = num_heads // num_kv_heads
+    k = k.repeat_interleave(n_rep, dim=1)
+    v = v.repeat_interleave(n_rep, dim=1)
+
+    scores = q @ k.transpose(-2, -1) / (head_dim ** 0.5)
+    mask = torch.triu(
+        torch.full((seq_len, seq_len), float('-inf')),
+        diagonal=1,
+    )
+    scores = scores + mask
+    weights_attn = F.softmax(scores, dim=-1)
+    output = weights_attn @ v
+    output = output.transpose(1, 2).reshape(batch_size, seq_len, hidden_size)
+    out = F.linear(
+        output,
+        weights[f"model.layers.{layer_idx}.self_attn.o_proj.weight"],
+    )
+
+    return out

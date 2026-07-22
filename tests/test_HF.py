@@ -3,6 +3,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.loader import load_weights
 from src.config import ModelConfig
 from src.layers import embedding, rmsnorm, rope_tables, apply_rope, attention, mlp
+from src.model import forward
 
 MODEL_DIR = "model"
 
@@ -14,6 +15,15 @@ weights = load_weights("model/model.safetensors")
 cfg = ModelConfig.from_json("model/config.json")
 ids = tok("The capital of Canada is", return_tensors="pt").input_ids
 emb = embedding(ids, weights["model.embed_tokens.weight"])
+
+mine_logits = forward(ids, weights, cfg)
+with torch.no_grad():
+    ref_logits = ref(ids).logits
+
+diff = torch.max(torch.abs(mine_logits - ref_logits))
+print("max abs diff:", diff.item())
+assert diff < 1e-3, "logits mismatch"
+print("logits match")
 
 attn_input = rmsnorm(
     emb,
@@ -56,4 +66,3 @@ diff = torch.max(torch.abs(mine_mlp - captured_mlp["mlp"]))
 print("mlp max abs diff:", diff.item())
 assert diff < 1e-3, "mlp mismatch"
 print("mlp matches")
-

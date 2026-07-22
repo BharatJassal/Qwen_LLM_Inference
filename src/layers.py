@@ -79,3 +79,10 @@ def attention(x, weights, layer_idx, config):
     )
 
     return out
+
+def mlp(x, weights, layer_idx):
+    gate = F.linear(x, weights[f"model.layers.{layer_idx}.mlp.gate_proj.weight"])
+    up = F.linear(x, weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"])
+    hidden = F.silu(gate) * up
+    out = F.linear(hidden, weights[f"model.layers.{layer_idx}.mlp.down_proj.weight"])
+    return out

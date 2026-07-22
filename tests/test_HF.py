@@ -16,7 +16,7 @@ cfg = ModelConfig.from_json("model/config.json")
 ids = tok("The capital of Canada is", return_tensors="pt").input_ids
 emb = embedding(ids, weights["model.embed_tokens.weight"])
 
-mine_logits = forward(ids, weights, cfg)
+mine_logits, _ = forward(ids, weights, cfg)
 with torch.no_grad():
     ref_logits = ref(ids).logits
 
@@ -30,7 +30,7 @@ attn_input = rmsnorm(
     weights["model.layers.0.input_layernorm.weight"],
     eps=cfg.rms_norm_eps
 )
-mine_attn = attention(attn_input, weights, 0, cfg)
+mine_attn, _ = attention(attn_input, weights, 0, cfg)
 capture = {}
 
 def hook(module, input, output):

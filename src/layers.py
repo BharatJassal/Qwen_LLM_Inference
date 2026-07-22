@@ -31,11 +31,17 @@ def rotate_half(x):
 def apply_rope(x, cos, sin):
     return (x * cos) + (rotate_half(x) * sin)
 
-def attention(x, weights, layer_idx, config):
+def attention(x, weights, layer_idx, config, layer_cache=None):
     num_heads = config.num_attention_heads
     head_dim = config.head_dim
     num_kv_heads = config.num_key_value_heads
     batch_size, seq_len, hidden_size = x.size()
+
+
+    if layer_cache is None:
+        past_len = 0
+    else:
+        past_len = layer_cache[0].shape[2] 
 
     q = F.linear(
         x,
@@ -56,20 +62,30 @@ def attention(x, weights, layer_idx, config):
     k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
     v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
-    cos, sin = rope_tables(seq_len, head_dim, config.rope_theta)
+    cos, sin = rope_tables(past_len + seq_len, head_dim, config.rope_theta)
+    cos = cos[past_len:]
+    sin = sin[past_len:]
     q = apply_rope(q, cos, sin)
     k = apply_rope(k, cos, sin)
+
+    if layer_cache is not None:
+        k = torch.cat([layer_cache[0], k], dim=2)
+        v = torch.cat([layer_cache[1], v], dim=2)
+    
+    new_layer_cache = (k, v)
 
     n_rep = num_heads // num_kv_heads
     k = k.repeat_interleave(n_rep, dim=1)
     v = v.repeat_interleave(n_rep, dim=1)
 
     scores = q @ k.transpose(-2, -1) / (head_dim ** 0.5)
-    mask = torch.triu(
-        torch.full((seq_len, seq_len), float('-inf')),
-        diagonal=1,
-    )
-    scores = scores + mask
+    if seq_len > 1:
+        mask = torch.triu(
+            torch.full((seq_len, seq_len), float('-inf')),
+            diagonal=1,
+        )
+        scores = scores + mask
+
     weights_attn = F.softmax(scores, dim=-1)
     output = weights_attn @ v
     output = output.transpose(1, 2).reshape(batch_size, seq_len, hidden_size)
@@ -78,7 +94,7 @@ def attention(x, weights, layer_idx, config):
         weights[f"model.layers.{layer_idx}.self_attn.o_proj.weight"],
     )
 
-    return out
+    return out, new_layer_cache
 
 def mlp(x, weights, layer_idx):
     gate = F.linear(x, weights[f"model.layers.{layer_idx}.mlp.gate_proj.weight"])

@@ -6,7 +6,6 @@ def quantize_weight(w):
     scales = torch.clamp(scales, min=1e-8) 
     w_scaled = w / scales
     w_quantized = torch.clamp(torch.round(w_scaled), min=-127, max=127).to(torch.int8)
-
     return w_quantized, scales
 
 def dequantize_weight(w_int, scales):
@@ -14,17 +13,17 @@ def dequantize_weight(w_int, scales):
     w_dequantized = w_int * scales
     return w_dequantized
 
-if __name__ == "__main__":
-    from src.loader import load_weights
-    weights = load_weights("model/model.safetensors")
+def quantize_model(weights):
+    quantized = {}
+    for key, value in weights.items():
+        if key.endswith("_proj.weight"):
+            quantized[key] = quantize_weight(value)
+        else:
+            quantized[key] = value
+    return quantized
 
-    w = weights["model.layers.0.self_attn.q_proj.weight"]
-    w_int8, scales = quantize_weight(w)
-    w_recovered = dequantize_weight(w_int8, scales)
-
-    print("shapes:", w.shape, w_int8.shape, scales.shape)
-    print("dtypes:", w.dtype, "->", w_int8.dtype)
-    print("original bytes: ", w.numel() * 4)
-    print("quantized bytes:", w_int8.numel() * 1 + scales.numel() * 4)
-    print("max abs error: ", torch.max(torch.abs(w - w_recovered)).item())
-    print("mean abs error:", torch.mean(torch.abs(w - w_recovered)).item())
+def get_weight(weights, key):
+    value = weights[key]
+    if isinstance(value, tuple):
+        return dequantize_weight(value[0], value[1])
+    return value

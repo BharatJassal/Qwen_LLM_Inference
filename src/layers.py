@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from src.quantize import get_weight
 
 def embedding(token_ids, embed_weight):
     embed_tokens = embed_weight[token_ids]
@@ -45,17 +46,17 @@ def attention(x, weights, layer_idx, config, layer_cache=None):
 
     q = F.linear(
         x,
-        weights[f"model.layers.{layer_idx}.self_attn.q_proj.weight"],
+        get_weight(weights, f"model.layers.{layer_idx}.self_attn.q_proj.weight"),
         weights[f"model.layers.{layer_idx}.self_attn.q_proj.bias"]
         )
     k = F.linear(
         x,
-        weights[f"model.layers.{layer_idx}.self_attn.k_proj.weight"],
+        get_weight(weights, f"model.layers.{layer_idx}.self_attn.k_proj.weight"),
         weights[f"model.layers.{layer_idx}.self_attn.k_proj.bias"]
         )
     v = F.linear(
         x,
-        weights[f"model.layers.{layer_idx}.self_attn.v_proj.weight"],
+        get_weight(weights, f"model.layers.{layer_idx}.self_attn.v_proj.weight"),
         weights[f"model.layers.{layer_idx}.self_attn.v_proj.bias"]
         )
     q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -91,14 +92,14 @@ def attention(x, weights, layer_idx, config, layer_cache=None):
     output = output.transpose(1, 2).reshape(batch_size, seq_len, hidden_size)
     out = F.linear(
         output,
-        weights[f"model.layers.{layer_idx}.self_attn.o_proj.weight"],
+        get_weight(weights, f"model.layers.{layer_idx}.self_attn.o_proj.weight"),
     )
 
     return out, new_layer_cache
 
 def mlp(x, weights, layer_idx):
-    gate = F.linear(x, weights[f"model.layers.{layer_idx}.mlp.gate_proj.weight"])
-    up = F.linear(x, weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"])
+    gate = F.linear(x, get_weight(weights, f"model.layers.{layer_idx}.mlp.gate_proj.weight"))
+    up = F.linear(x, get_weight(weights, f"model.layers.{layer_idx}.mlp.up_proj.weight"))
     hidden = F.silu(gate) * up
-    out = F.linear(hidden, weights[f"model.layers.{layer_idx}.mlp.down_proj.weight"])
+    out = F.linear(hidden, get_weight(weights, f"model.layers.{layer_idx}.mlp.down_proj.weight"))
     return out

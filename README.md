@@ -29,7 +29,24 @@ Without KV caching, every new token requires a full forward pass over the entire
 
 - **Grouped-query attention:** 2 KV heads serve 14 query heads; each KV head is broadcast across its query group before scaled dot product.
 - **RoPE:** rotate half convention, precomputed cos/sin tables from `rope_theta`; during cached decoding, the new token's rotation uses its **absolute** position.
-- **Qwen-specific details:** bias terms on QKV projections, tied input/output embeddings 
+- **Qwen-specific details:** bias terms on QKV projections, tied input/output embeddings
+
+### INT8 Quantization
+
+Linear layer weights are quantized using per channel symmetric INT8 and dequantized back to FP32 right before each matrix multiplication. Layer norms, biases, and embedding tables stay in FP32.
+
+| Measurement | fp32 | int8 | Change |
+|---|---|---|---|
+| Quantized tensors | 1365.0 MB | 342.41 MB | 3.99x reduction |
+| Whole model | 1884.59 MB | 862.00 MB | 2.19x reduction |
+| Perplexity | 20.8487 | 20.8605 | +0.06% |
+
+Measured on Project Gutenberg ebook 1342 (*Pride and Prejudice*).
+
+The reason why the whole model reduction is only 2.19x instead of 4x is because `embed_tokens.weight` matrix 
+(151936 x 896, ~519 MB in fp32) is left unquantized. Because the model uses tied embeddings, any quantization error here degrades the input token representation and the final logic prediction. At this model size the embedding is a large fraction of total parameters, but in larger models it is negligible and the whole model int8 approaches the full 4x.
+
+Production engines use custom fused INT8 GEMM kernels to accelerate compute on hardware. Here, weights dequantize to FP32 right before `torch.matmul` giving you the full RAM savings while keeping the Pytorch implementation clean and dependency free.
 
 ## Usage
 

@@ -67,3 +67,17 @@ def generate_sample(token_ids, weights, config, max_new_tokens, temperature, top
 
     gen_tensor = torch.tensor([generated], dtype=token_ids.dtype)
     return torch.cat([token_ids, gen_tensor], dim=1)
+
+@torch.no_grad()
+def stream_sample(token_ids, weights, config, max_new_tokens, temperature, top_p):
+    logits, cache = forward(token_ids, weights, config)
+    next_token = sample(logits[0, -1, :], temperature, top_p)
+
+    for _ in range(max_new_tokens):
+        if next_token.item() == config.eos_token_id:
+            break
+        yield next_token.item()
+
+        next_input = next_token.view(1, 1)
+        logits, cache = forward(next_input, weights, config, cache)
+        next_token = sample(logits[0, -1, :], temperature, top_p)

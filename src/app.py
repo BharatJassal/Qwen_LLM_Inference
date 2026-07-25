@@ -1,10 +1,11 @@
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import torch
 from transformers import AutoTokenizer
 from src.loader import load_weights
 from src.config import ModelConfig
-from src.generate import generate_sample
+from src.generate import generate_sample, stream_sample
 
 MODEL_DIR = "model"
 
@@ -40,3 +41,16 @@ def generate(req: GenerateRequest):
 
     completion = tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
     return {"text": completion}
+
+@app.post("/generate/stream")
+def generate_stream(req: GenerateRequest):
+    messages = [{"role": "user", "content": req.prompt}]
+    text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    ids = tok(text, return_tensors="pt").input_ids
+
+    def token_stream():
+        for token_id in stream_sample(ids, weights, cfg,
+                                       req.max_tokens, req.temperature, req.top_p):
+            yield tok.decode([token_id], skip_special_tokens=True)
+
+    return StreamingResponse(token_stream(), media_type="text/plain")

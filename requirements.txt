@@ -3,3 +3,5 @@ safetensors
 numpy
 transformers
 huggingface_hub
+fastapi
+uvicorn

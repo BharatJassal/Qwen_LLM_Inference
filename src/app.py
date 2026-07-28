@@ -7,6 +7,7 @@ from src.loader import load_weights
 from src.config import ModelConfig
 from src.generate import generate_sample, stream_sample
 import asyncio
+from fastapi.middleware.cors import CORSMiddleware
 
 MODEL_DIR = "model"
 generation_lock = asyncio.Lock()
@@ -16,6 +17,12 @@ cfg = ModelConfig.from_json(f"{MODEL_DIR}/config.json")
 print("Model loaded.")
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int = 50

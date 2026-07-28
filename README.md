@@ -1,11 +1,11 @@
 # Qwen LLM Inference
 
-Built a inference engine for **Qwen2.5-0.5B-Instruct** from scratch, developed in pure PyTorch by loading raw `safetensors` weights directly, without using `transformers`. Implemented the Llama architecture (RoPE, GQA, SwiGLU, RMSNorm), autoregressive decoding with sampling, and KV caching, verifying each component against HuggingFace.
+Built an inference engine for **Qwen2.5-0.5B-Instruct** from scratch, developed in pure PyTorch by loading raw `safetensors` weights directly, without using `transformers`. Implemented the Llama architecture (RoPE, GQA, SwiGLU, RMSNorm), autoregressive decoding with sampling, and KV caching, verifying each component against HuggingFace.
 
 
 ## Purpose
 
-Modern LLM stacks such as vLLM, llama.cpp and more hide the complexity involved in running a model. This project rebuilds that pipeline from the ground, to better understand how it works. From mapping weights to computations, understanding how KV caching speeds up generation by avoiding redundant computations.
+Modern LLM stacks such as vLLM, llama.cpp and more hide the complexity involved in running a model. This project rebuilds that pipeline from the ground up, to better understand how it works. From mapping weights to computations, understanding how KV caching speeds up generation by avoiding redundant computations.
 
 ## Results
 
@@ -44,16 +44,46 @@ Linear layer weights are quantized using per channel symmetric INT8 and dequanti
 Measured on Project Gutenberg ebook 1342 (*Pride and Prejudice*).
 
 The reason why the whole model reduction is only 2.19x instead of 4x is because `embed_tokens.weight` matrix 
-(151936 x 896, ~519 MB in fp32) is left unquantized. Because the model uses tied embeddings, any quantization error here degrades the input token representation and the final logic prediction. At this model size the embedding is a large fraction of total parameters, but in larger models it is negligible and the whole model int8 approaches the full 4x.
+(151936 x 896, ~519 MB in fp32) is left unquantized. Because the model uses tied embeddings, any quantization error here degrades the input token representation and the final logit prediction. At this model size the embedding is a large fraction of total parameters, but in larger models it is negligible and the whole model int8 approaches the full 4x.
 
 Production engines use custom fused INT8 GEMM kernels to accelerate compute on hardware. Here, weights dequantize to FP32 right before `torch.matmul` giving you the full RAM savings while keeping the Pytorch implementation clean and dependency free.
+
+## Serving
+
+The engine is served through a FastAPI app with token level SSE streaming, an asyncio request queue, and a browser chat UI served at the root route.
+
+```bash
+uvicorn src.app:app --port 8000
+
+# or with Docker
+docker build -t qwen-inference .
+docker run -p 8000:8000 qwen-inference
+```
+
+### Load test
+
+50-token generations on CPU, all requests fired simultaneously via `asyncio.gather`.
+
+| Clients | p50 (s) | p95 (s) | Wall clock (s) | Req/s |
+|---|---|---|---|---|
+| 1 | 10.28 | 10.28 | 10.28 | 0.10 |
+| 4 | 58.13 | 77.89 | 77.89 | 0.05 |
+| 8 | 66.44 | 118.90 | 118.90 | 0.07 |
+
+Latency degrades roughly linearly with concurrency because an `asyncio.Lock` serializes generation. Only one request generates at a time, so at 8 clients the last request in line waits behind the other 7, pushing p95 to roughly 2x p50. Production engines solve this with continuous batching, where multiple sequences share each forward pass instead of queuing for the model.
 
 ## Usage
 
 ```bash
+git clone https://github.com/BharatJassal/Qwen_LLM_Inference.git
+cd Qwen_LLM_Inference
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python download_model.py
+```
 
+```bash
 python -m tests.test_HF
 python -m tests.test_generate
 python -m tests.test_gate2
@@ -83,7 +113,7 @@ out = greedy_cached(ids, weights, cfg, max_new_tokens=50)
 print(tok.decode(out[0]))
 ```
 
-## Notes/References
+## References
 - Qwen2.5 technical report / model card
 - Tokenizer is reused from HuggingFace `AutoTokenizer`. This project implements the model.
 - `transformers` appears in requirements as the verification reference and tokenizer.

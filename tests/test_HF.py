@@ -6,14 +6,14 @@ from src.layers import embedding, rmsnorm, rope_tables, apply_rope, attention, m
 from src.model import forward
 
 MODEL_DIR = "model"
-
+device = "cuda" if torch.cuda.is_available() else "cpu"
 ref = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32)
 ref.eval()
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-weights = load_weights("model/model.safetensors")
-
+weights = load_weights("model/model.safetensors", device)
+text = "What is the capital of Canada?"
 cfg = ModelConfig.from_json("model/config.json")
-ids = tok("The capital of Canada is", return_tensors="pt").input_ids
+ids = tok(text, return_tensors="pt").input_ids.to(device)
 emb = embedding(ids, weights["model.embed_tokens.weight"])
 
 mine_logits, _ = forward(ids, weights, cfg)

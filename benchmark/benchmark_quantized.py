@@ -25,14 +25,15 @@ def perplexity(ids, weights, config):
 
 
 def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL_DIR)
     cfg = ModelConfig.from_json("model/config.json")
-    weights = load_weights("model/model.safetensors")
+    weights = load_weights("model/model.safetensors", device)
 
     with open(TEXT_PATH, "r", encoding="utf-8") as f:
         text = f.read()
 
-    ids = tok(text, return_tensors="pt").input_ids[:, :MAX_TOKENS]
+    ids = tok(text, return_tensors="pt").input_ids[:, :MAX_TOKENS].to(device)
 
     q_weights = quantize_model(weights)
     compare_memory(weights, q_weights)

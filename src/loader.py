@@ -2,12 +2,11 @@ from safetensors import safe_open
 import torch
 
 
-def load_weights(path):
+def load_weights(path, device="cpu"):
     weight = {}
     with safe_open(path, framework="pt",) as f: 
         for key in f.keys():
-            weight[key] = f.get_tensor(key).to(torch.float32)
-        
+            weight[key] = f.get_tensor(key).to(device=device, dtype=torch.float32)
     return weight
 
 

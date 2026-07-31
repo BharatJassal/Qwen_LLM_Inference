@@ -64,6 +64,8 @@ def attention(x, weights, layer_idx, config, layer_cache=None):
     v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
     cos, sin = rope_tables(past_len + seq_len, head_dim, config.rope_theta)
+    cos = cos.to(x.device)
+    sin = sin.to(x.device)
     cos = cos[past_len:]
     sin = sin[past_len:]
     q = apply_rope(q, cos, sin)
@@ -82,7 +84,7 @@ def attention(x, weights, layer_idx, config, layer_cache=None):
     scores = q @ k.transpose(-2, -1) / (head_dim ** 0.5)
     if seq_len > 1:
         mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf')),
+            torch.full((seq_len, seq_len), float('-inf'), device=x.device),
             diagonal=1,
         )
         scores = scores + mask

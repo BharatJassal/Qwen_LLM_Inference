@@ -1,3 +1,4 @@
+import torch
 import time
 from transformers import AutoTokenizer
 from src.loader import load_weights
@@ -10,10 +11,10 @@ PROMPT = "Write a story about the ocean."
 RUN_NAIVE = True
 
 
-def build_ids(tok):
+def build_ids(tok, device):
     messages = [{"role": "user", "content": PROMPT}]
     text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return tok(text, return_tensors="pt").input_ids
+    return tok(text, return_tensors="pt").input_ids.to(device)
 
 
 def time_generation(fn, ids, weights, config, n):
@@ -25,10 +26,11 @@ def time_generation(fn, ids, weights, config, n):
 
 
 def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-    weights = load_weights("model/model.safetensors")
+    weights = load_weights("model/model.safetensors", device=device)
     cfg = ModelConfig.from_json("model/config.json")
-    ids = build_ids(tok)
+    ids = build_ids(tok, device)
 
     rows = []
     for n in LENGTHS:

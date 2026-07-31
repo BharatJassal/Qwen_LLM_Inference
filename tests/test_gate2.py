@@ -5,14 +5,15 @@ from src.loader import load_weights
 from src.config import ModelConfig
 from src.generate import greedy, greedy_cached
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_DIR = "model"
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-weights = load_weights("model/model.safetensors")
+weights = load_weights("model/model.safetensors", device)
 cfg = ModelConfig.from_json("model/config.json")
 
 messages = [{"role": "user", "content": "Write a long story multiple paragraphs about a robot who learns love"}]
 text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-ids = tok(text, return_tensors="pt").input_ids
+ids = tok(text, return_tensors="pt").input_ids.to(device)
 N = 500
 
 start_naive = time.time()

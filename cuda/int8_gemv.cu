@@ -30,7 +30,7 @@
 
 const float PEAK_GBPS = 484.0f;  // Tailored to personal Nvidia GTX 1080 Ti memory bandwidth
 const int THREADS = 256;         
-const int ROWS_PER_BLOCK = 1;    
+const int ROWS_PER_BLOCK = 8;    
 const int ITERS = 200;           
 
 __global__ void int8_gemv(const int8_t* __restrict__ W,
@@ -38,25 +38,21 @@ __global__ void int8_gemv(const int8_t* __restrict__ W,
                           const float* __restrict__ x,
                           float* __restrict__ y,
                           int rows, int cols) {
-    int row = blockIdx.x;
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * ROWS_PER_BLOCK + warp;
+    if (row>=rows) return;
     const int8_t* w = W + (size_t)row * cols;
 
     float sum = 0.0f;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+    for (int j = lane; j < cols; j += 32) {
         sum += (float)w[j] * x[j];
     }
-    __shared__ float partial[THREADS];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-        if (threadIdx.x < offset) {
-            partial[threadIdx.x] += partial[threadIdx.x + offset];
-        }
-        __syncthreads();
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
     }
-    if (threadIdx.x == 0) {
-        y[row] = scale[row] * partial[0];
+    if (lane == 0) {
+        y[row] = scale[row] * sum;
     }
 
 }

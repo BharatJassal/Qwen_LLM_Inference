@@ -1,3 +1,5 @@
+// $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -version "[17.0,18.0)" -property installationPath
+// & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
 // Fused INT8 GEMV: y[i] = scale[i] * sum_j W[i][j] * x[j]
 //
 // W is int8 (rows x cols, row-major), scale is one float per row (from
@@ -43,10 +45,14 @@ __global__ void int8_gemv(const int8_t* __restrict__ W,
     int row = blockIdx.x * ROWS_PER_BLOCK + warp;
     if (row>=rows) return;
     const int8_t* w = W + (size_t)row * cols;
+    const char4* w4 = reinterpret_cast<const char4*>(w);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
 
     float sum = 0.0f;
-    for (int j = lane; j < cols; j += 32) {
-        sum += (float)w[j] * x[j];
+    for (int j = lane; j < cols / 4; j += 32) {
+        char4 wv = w4[j];
+        float4 xv = x4[j];
+        sum += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
     }
     for (int offset = 16; offset > 0; offset /= 2) {
         sum += __shfl_down_sync(0xffffffff, sum, offset);

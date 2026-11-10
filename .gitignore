@@ -3,3 +3,8 @@ __pycache__/
 *.safetensors
 model/
 gutenberg.txt
+*.exe
+*.exp
+*.lib
+*.obj
+trace.json

@@ -28,7 +28,7 @@ def greedy_cached(token_ids, weights, config, max_new_tokens):
         logits, cache = forward(next_input, weights, config, cache)
         next_token = torch.argmax(logits[0, -1, :])
 
-    gen_tensor = torch.tensor([generated], dtype=token_ids.dtype)
+    gen_tensor = torch.tensor([generated], dtype=token_ids.dtype, device=token_ids.device)
     return torch.cat([token_ids, gen_tensor], dim=1)
 
 @torch.no_grad()
@@ -65,7 +65,7 @@ def generate_sample(token_ids, weights, config, max_new_tokens, temperature, top
         logits, cache = forward(next_input, weights, config, cache)
         next_token = sample(logits[0, -1, :], temperature, top_p)
 
-    gen_tensor = torch.tensor([generated], dtype=token_ids.dtype)
+    gen_tensor = torch.tensor([generated], dtype=token_ids.dtype, device=token_ids.device)
     return torch.cat([token_ids, gen_tensor], dim=1)
 
 @torch.no_grad()

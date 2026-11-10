@@ -7,7 +7,7 @@ from src.model import forward
 
 MODEL_DIR = "model"
 device = "cuda" if torch.cuda.is_available() else "cpu"
-ref = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32)
+ref = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32).to(device)
 ref.eval()
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
 weights = load_weights("model/model.safetensors", device)

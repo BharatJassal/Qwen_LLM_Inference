@@ -19,6 +19,7 @@
 #include <vector>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #define CHECK(call)                                                            \
     do {                                                                       \
@@ -109,7 +110,7 @@ void gemv_cpu(const std::vector<int8_t>& W, const std::vector<float>& scale,
     }
 }
 
-bool run_shape(const char* name, int rows, int cols) {
+bool run_shape(cublasHandle_t handle, const char* name, int rows, int cols) {
     // test data
     std::vector<int8_t> hW((size_t)rows * cols);
     std::vector<float> hScale(rows), hX(cols), hY(rows);
@@ -159,7 +160,18 @@ bool run_shape(const char* name, int rows, int cols) {
            name, rows, cols, pass ? "PASS" : "FAIL", max_err, us, floor_us, ideal_us,
            gbps, 100.0 * gbps / PEAK_GBPS);
     if (!pass) printf("         (GB/s is meaningless until the shape passes)\n");
-
+    float* dWf;
+    CHECK(cudaMalloc(&dWf, (size_t)rows * cols * sizeof(float)));
+    CHECK(cudaMemset(dWf, 0, (size_t)rows * cols * sizeof(float)));
+    const float alpha = 1.0f, beta = 0.0f;
+    double cublas_us = time_us([&] {
+        cublasSgemv(handle, CUBLAS_OP_T, cols, rows, &alpha, dWf, cols, dX, 1, &beta, dY, 1);
+    });
+    double cublas_bytes = (double)rows * cols * 4.0 + cols * 4.0 + rows * 4.0;
+    double cublas_gbps = cublas_bytes / (cublas_us * 1e-6) / 1e9;
+    printf("         cuBLAS FP32 %6.2f us  %5.1f GB/s  %4.1f%% of peak  ->  INT8 kernel is %.2fx faster\n",
+           cublas_us, cublas_gbps, 100.0 * cublas_gbps / PEAK_GBPS, cublas_us / us);
+    CHECK(cudaFree(dWf));
     CHECK(cudaFree(dW));
     CHECK(cudaFree(dScale));
     CHECK(cudaFree(dX));
@@ -169,10 +181,13 @@ bool run_shape(const char* name, int rows, int cols) {
 
 int main() {
     srand(0);
+    cublasHandle_t handle;
+    cublasCreate(&handle);
     bool ok = true;
-    ok &= run_shape("gate/up", 4864, 896);
-    ok &= run_shape("down", 896, 4864);
-    ok &= run_shape("q/o", 896, 896);
+    ok &= run_shape(handle, "gate/up", 4864, 896);
+    ok &= run_shape(handle, "down", 896, 4864);
+    ok &= run_shape(handle, "q/o", 896, 896);
+    cublasDestroy(handle);
     printf(ok ? "\nAll shapes PASS\n" : "\nSome shapes FAIL\n");
     return ok ? 0 : 1;
 }

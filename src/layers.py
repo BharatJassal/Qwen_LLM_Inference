@@ -2,6 +2,26 @@ import torch
 import torch.nn.functional as F
 from src.quantize import get_weight
 
+from src import int8_ext
+
+USE_FUSED = True
+
+
+def linear(x, weights, key, bias=None):
+    w = weights[key]
+    is_decode = x.shape[0] * x.shape[1] == 1
+
+    if (USE_FUSED and isinstance(w, tuple) and is_decode
+            and x.is_cuda and int8_ext.available()):
+        x_flat = x.reshape(-1).contiguous()
+        y = int8_ext.int8_gemv(w[0], w[1], x_flat)
+        y = y.view(1, 1, -1)
+        if bias is not None:
+            y = y + bias
+        return y
+
+    return F.linear(x, get_weight(weights, key), bias)
+
 def embedding(token_ids, embed_weight):
     embed_tokens = embed_weight[token_ids]
     return embed_tokens
@@ -44,21 +64,24 @@ def attention(x, weights, layer_idx, config, layer_cache=None):
     else:
         past_len = layer_cache[0].shape[2] 
 
-    q = F.linear(
+    q = linear(
         x,
-        get_weight(weights, f"model.layers.{layer_idx}.self_attn.q_proj.weight"),
+        weights,
+        f"model.layers.{layer_idx}.self_attn.q_proj.weight",
         weights[f"model.layers.{layer_idx}.self_attn.q_proj.bias"]
-        )
-    k = F.linear(
+    )
+    k = linear(
         x,
-        get_weight(weights, f"model.layers.{layer_idx}.self_attn.k_proj.weight"),
+        weights,
+        f"model.layers.{layer_idx}.self_attn.k_proj.weight",
         weights[f"model.layers.{layer_idx}.self_attn.k_proj.bias"]
-        )
-    v = F.linear(
+    )
+    v = linear(
         x,
-        get_weight(weights, f"model.layers.{layer_idx}.self_attn.v_proj.weight"),
+        weights,
+        f"model.layers.{layer_idx}.self_attn.v_proj.weight",
         weights[f"model.layers.{layer_idx}.self_attn.v_proj.bias"]
-        )
+    )
     q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
     k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
     v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
@@ -92,16 +115,17 @@ def attention(x, weights, layer_idx, config, layer_cache=None):
     weights_attn = F.softmax(scores, dim=-1)
     output = weights_attn @ v
     output = output.transpose(1, 2).reshape(batch_size, seq_len, hidden_size)
-    out = F.linear(
+    out = linear(
         output,
-        get_weight(weights, f"model.layers.{layer_idx}.self_attn.o_proj.weight"),
+        weights,
+        f"model.layers.{layer_idx}.self_attn.o_proj.weight"
     )
 
     return out, new_layer_cache
 
 def mlp(x, weights, layer_idx):
-    gate = F.linear(x, get_weight(weights, f"model.layers.{layer_idx}.mlp.gate_proj.weight"))
-    up = F.linear(x, get_weight(weights, f"model.layers.{layer_idx}.mlp.up_proj.weight"))
+    gate = linear(x, weights, f"model.layers.{layer_idx}.mlp.gate_proj.weight")
+    up = linear(x, weights, f"model.layers.{layer_idx}.mlp.up_proj.weight")
     hidden = F.silu(gate) * up
-    out = F.linear(hidden, get_weight(weights, f"model.layers.{layer_idx}.mlp.down_proj.weight"))
+    out = linear(hidden, weights, f"model.layers.{layer_idx}.mlp.down_proj.weight")
     return out

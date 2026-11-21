@@ -1,20 +1,24 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import torch
 from transformers import AutoTokenizer
 from src.loader import load_weights
 from src.config import ModelConfig
-from src.generate import generate_sample, stream_sample
+from src.generate import stream_sample
+from src.batching import BatchEngine
 import asyncio
+import threading
 from fastapi.middleware.cors import CORSMiddleware
 
 MODEL_DIR = "model"
-generation_lock = asyncio.Lock()
+device = "cuda" if torch.cuda.is_available() else "cpu"
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-weights = load_weights(f"{MODEL_DIR}/model.safetensors")
+weights = load_weights(f"{MODEL_DIR}/model.safetensors", device)
 cfg = ModelConfig.from_json(f"{MODEL_DIR}/config.json")
-print("Model loaded.")
+engine = BatchEngine(weights, cfg) if device == "cuda" else None
+cpu_lock = threading.Lock()
+print(f"Model loaded on {device}.")
 app = FastAPI()
 
 app.add_middleware(
@@ -33,30 +37,33 @@ class GenerateRequest(BaseModel):
 def root():
     return {"status": "alive"}
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
+def cpu_stream(ids, req):
+    with cpu_lock:
+        yield from stream_sample(ids, weights, cfg, req.max_tokens, req.temperature, req.top_p)
+
+def token_ids(req):
     messages = [{"role": "user", "content": req.prompt}]
     text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    ids = tok(text, return_tensors="pt").input_ids
-    async with generation_lock:
-        out = await asyncio.to_thread(
-            generate_sample,
-            ids, weights, cfg,
-            req.max_tokens, req.temperature, req.top_p,
-        )
+    ids = tok(text, return_tensors="pt").input_ids.to(device)
+    if engine is None:
+        return cpu_stream(ids, req)
+    try:
+        return engine.submit(ids, req.max_tokens, req.temperature, req.top_p)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    completion = tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
-    return {"text": completion}
+@app.post("/generate")
+async def generate(req: GenerateRequest):
+    stream = token_ids(req)
+    out = await asyncio.to_thread(list, stream)
+    return {"text": tok.decode(out, skip_special_tokens=True)}
 
 @app.post("/generate/stream")
 def generate_stream(req: GenerateRequest):
-    messages = [{"role": "user", "content": req.prompt}]
-    text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    ids = tok(text, return_tensors="pt").input_ids
+    stream = token_ids(req)
 
     def token_stream():
-        for token_id in stream_sample(ids, weights, cfg,
-                                       req.max_tokens, req.temperature, req.top_p):
+        for token_id in stream:
             yield tok.decode([token_id], skip_special_tokens=True)
 
     return StreamingResponse(token_stream(), media_type="text/plain")

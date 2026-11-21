@@ -38,4 +38,78 @@ Experiments on top of v3 (not kept):
 | gate/up | 21.48 | 73.99 | 3.44x |
 | down | 19.13 | 66.39 | 3.47x |
 | q/o | 6.45 | 12.22 | 1.89x |
-TODO: rerun 2-3 times on the desktop and record the median.
+
+Rerun 3 times on the desktop (2026-11-20), median per shape, us:
+| Shape | INT8 kernel | cuBLAS FP32 | Speedup |
+|---|---|---|---|
+| gate/up | 18.36 | 54.98 | 2.99x |
+| down | 15.82 | 54.67 | 3.46x |
+| q/o | 6.73 | 12.00 | 1.78x |
+q/o is noisy (5.38-11.26 us across runs): at ~6 us it sits on the ~5 us launch floor.
+
+## INT8 kernel in the model (int8_gemv_ext via torch cpp_extension, layers.linear)
+- tests.test_int8_kernel: all 7 layer-0 projections max rel err <= 2.6e-07 vs dequantize; 200-token greedy decode identical with USE_FUSED on/off
+- bench_int8_speed, 300 tokens cached, 3 runs: FP32 50.4 / 50.1 / 51.5 tok/s, INT8 46.8 / 46.7 / 47.4 tok/s
+- Median INT8 46.8 tok/s vs 28.3 before (1.65x), still ~7% behind FP32: decode is CPU launch bound (see profile), so the ~3x faster GEMVs mostly hide behind launch overhead
+
+## CUDA graph decode (generate.greedy_graph, model.decode_step)
+Prefill runs on the normal path; each decode token is one replay of a captured graph instead of ~1100 launches.
+Needs a fixed-size KV cache (written in place at pos, later slots masked) and RoPE tables indexed on the GPU.
+- tests.test_graph: 300-token greedy decode identical to greedy_cached for FP32 and INT8 (fused kernel inside the graph)
+- bench_int8_speed, 300 tokens, 3 runs, tok/s (includes prefill and graph capture):
+
+| Weights | greedy_cached | greedy_graph | Speedup |
+|---|---|---|---|
+| FP32 | 46.9 / 51.6 / 52.4 (median 51.6) | 95.2 / 102.9 / 102.6 (median 102.6) | 2.0x |
+| INT8 | 42.4 / 48.9 / 49.7 (median 48.9) | 147.8 / 144.6 / 150.9 (median 147.8) | 3.0x |
+
+With launch overhead gone, INT8 is finally faster than FP32 end to end: 147.8 vs 102.6 tok/s (1.44x), where it was ~5% slower before.
+
+## Chat app on the graph path (stream_sample -> stream_graph on CUDA)
+App now loads weights on CUDA when available (was always CPU); greedy and sampling share stream_graph, token choice (argmax / sample) runs outside the graph.
+Both endpoints share one threading.Lock (stream endpoint had none; concurrent graph captures would fail).
+- tests.test_graph: seed 0, T=0.8, top_p=0.9, 100 tokens: graph sampling identical to cached sampling (FP32 and INT8); tests.test_sample Degenerate Pass
+- bench_int8_speed after moving argmax outside the graph: FP32 graph 102.8 tok/s, INT8 graph 148.8 tok/s (no change)
+- bench_app (100-token /generate, FP32 weights, GPU + graphs):
+
+| Clients | p50 (s) | p95 (s) | Wall (s) | Req/s |
+|---|---|---|---|---|
+| 1 | 1.31 | 1.31 | 1.31 | 0.76 |
+| 4 | 3.36 | 3.85 | 3.85 | 1.04 |
+| 8 | 4.09 | 5.91 | 5.92 | 1.35 |
+
+## Reruns for medians (2026-11-20)
+- INT8 dequantize every call (layers.USE_FUSED = False), greedy_cached 300 tokens, 3 runs: 30.4 / 30.3 / 30.5 tok/s, median 30.4 (earlier single run: 28.3)
+- bench_app, GPU, FP32, CUDA graphs, 3 more runs (p50 / p95 / wall / req/s):
+
+| Clients | Run 1 | Run 2 | Run 3 | Median per column |
+|---|---|---|---|---|
+| 1 | 1.10 / 1.10 / 1.10 / 0.91 | 0.47 / 0.47 / 0.47 / 2.14 | 0.77 / 0.77 / 0.77 / 1.30 | 0.77 / 0.77 / 0.77 / 1.30 |
+| 4 | 2.50 / 2.68 / 2.68 / 1.49 | 3.32 / 4.33 / 4.33 / 0.92 | 1.64 / 2.66 / 2.66 / 1.50 | 2.50 / 2.68 / 2.68 / 1.49 |
+| 8 | 5.35 / 6.77 / 6.77 / 1.18 | 5.01 / 6.36 / 6.37 / 1.26 | 4.12 / 7.19 / 7.19 / 1.11 | 5.01 / 6.77 / 6.77 / 1.18 |
+
+Large run to run spread: requests sample at temperature 0.7 and stop at EOS, so reply length (work per request) varies. max_tokens=100 is a cap, not a fixed length.
+
+## Continuous batching (src/batching.py BatchEngine, 8 slots, max_len 2048, FP32)
+- tests.test_batching: 6 greedy requests on 4 slots (2 queued, 2 stop early at EOS), every output identical to greedy_cached; over-long request rejected; 4 cancelled streams free their slots
+- Bug found on the way: RoPE tables and positions were locals in __init__, freed after capture, and the graph then read reused memory (first decode logits off by 19.6). Fixed by keeping them on the engine.
+- decode_step now batched and uses grouped GQA instead of repeat_interleave; test_graph still passes, greedy_graph FP32 99.3 / INT8 145.8 tok/s (1 run)
+- Graph step cost (ms): 1 slot 11.23, 8 slots 16.80 at max_len 2048; 9.59 / 14.00 at max_len 256. So graphs are captured per batch size (1, 2, 4, 8).
+- bench_batching, 100 greedy tokens per request, 3 runs, tok/s (one at a time / batched):
+
+| Requests | Run 1 | Run 2 | Run 3 | Median speedup |
+|---|---|---|---|---|
+| 1 | 98.1 / 88.2 | 98.6 / 88.1 | 97.2 / 87.7 | 0.90x |
+| 4 | 97.9 / 284.8 | 98.3 / 286.0 | 98.0 / 285.4 | 2.91x |
+| 8 | 98.1 / 402.5 | 97.9 / 400.1 | 97.9 / 401.0 | 4.10x |
+
+With a single 8 slot graph (before per-size graphs) a lone request ran at 58.0 tok/s.
+
+- bench_app, batched app, 3 runs (p50 / p95 / wall / req/s):
+
+| Clients | Run 1 | Run 2 | Run 3 | Median per column |
+|---|---|---|---|---|
+| 1 | 0.47 / 0.47 / 0.47 / 2.12 | 1.53 / 1.53 / 1.53 / 0.65 | 1.54 / 1.54 / 1.54 / 0.65 | 1.53 / 1.53 / 1.53 / 0.65 |
+| 4 | 2.04 / 2.04 / 2.04 / 1.96 | 1.90 / 1.90 / 1.90 / 2.10 | 2.00 / 2.00 / 2.00 / 2.00 | 2.00 / 2.00 / 2.00 / 2.00 |
+| 8 | 2.90 / 2.91 / 2.91 / 2.75 | 2.76 / 2.76 / 2.76 / 2.90 | 3.00 / 3.01 / 3.01 / 2.66 | 2.90 / 2.91 / 2.91 / 2.75 |
+

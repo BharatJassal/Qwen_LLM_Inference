@@ -7,7 +7,7 @@ from src.model import forward
 from src.quantize import quantize_model, compare_memory
 
 MODEL_DIR = "model"
-TEXT_PATH = test.txt # Put text file here. Ex "gutenberg.txt"
+TEXT_PATH = "gutenberg.txt"
 MAX_TOKENS = 300
 
 

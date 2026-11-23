@@ -9,13 +9,12 @@ USE_FUSED = True
 
 def linear(x, weights, key, bias=None):
     w = weights[key]
-    is_decode = x.shape[0] * x.shape[1] == 1
+    n = x.shape[0] * x.shape[1]
 
-    if (USE_FUSED and isinstance(w, tuple) and is_decode
+    if (USE_FUSED and isinstance(w, tuple) and n <= int8_ext.MAX_BATCH
             and x.is_cuda and int8_ext.available()):
-        x_flat = x.reshape(-1).contiguous()
-        y = int8_ext.int8_gemv(w[0], w[1], x_flat)
-        y = y.view(1, 1, -1)
+        y = int8_ext.int8_gemv(w[0], w[1], x.reshape(n, -1).contiguous())
+        y = y.view(x.shape[0], x.shape[1], -1)
         if bias is not None:
             y = y + bias
         return y

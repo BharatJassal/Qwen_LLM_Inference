@@ -24,6 +24,24 @@ for name in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_a
     print(f"{name:18s} {tuple(w_int8.shape)}  max rel err {rel:.2e}")
     assert rel < 1e-5, f"{name} kernel mismatch"
 
+    for b in range(2, int8_ext.MAX_BATCH + 1):
+        xb = torch.randn(b, w_int8.shape[1], device=device)
+        got = int8_ext.int8_gemv(w_int8, scales, xb)
+        ref = xb @ get_weight(weights, key).T
+        assert ((got - ref).abs().max() / ref.abs().max()).item() < 1e-5, f"{name} batch {b} mismatch"
+        # each row should match running it alone exactly
+        alone = torch.stack([int8_ext.int8_gemv(w_int8, scales, r.contiguous()) for r in xb])
+        assert torch.equal(got, alone), f"{name} batch {b} rows differ from single row results"
+print(f"batched kernel matches dequantize for batch 2 to {int8_ext.MAX_BATCH}")
+
+for bad in [torch.randn(int8_ext.MAX_BATCH + 1, 896, device=device), torch.randn(3, 900, device=device)]:
+    try:
+        int8_ext.int8_gemv(*weights["model.layers.0.self_attn.q_proj.weight"], bad)
+        raise AssertionError(f"kernel accepted x of shape {tuple(bad.shape)}")
+    except RuntimeError:
+        pass
+print("bad batch shapes rejected")
+
 # decoding with and without the kernel should give the same tokens
 tok = AutoTokenizer.from_pretrained("model")
 msgs = [{"role": "user", "content": "Write a story about the ocean."}]

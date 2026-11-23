@@ -7,6 +7,8 @@ from src.loader import load_weights
 from src.config import ModelConfig
 from src.generate import stream_sample
 from src.batching import BatchEngine
+from src.quantize import quantize_model
+from src import int8_ext
 import asyncio
 import threading
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +17,14 @@ MODEL_DIR = "model"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
 weights = load_weights(f"{MODEL_DIR}/model.safetensors", device)
+# without the kernel INT8 is slower than FP32
+use_int8 = int8_ext.available()
+if use_int8:
+    weights = quantize_model(weights)
 cfg = ModelConfig.from_json(f"{MODEL_DIR}/config.json")
 engine = BatchEngine(weights, cfg) if device == "cuda" else None
 cpu_lock = threading.Lock()
-print(f"Model loaded on {device}.")
+print(f"Model loaded on {device}, {'INT8' if use_int8 else 'FP32'} weights.")
 app = FastAPI()
 
 app.add_middleware(

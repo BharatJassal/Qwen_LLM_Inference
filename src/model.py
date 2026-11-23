@@ -48,7 +48,7 @@ def decode_step(tok, pos, weights, config, k_cache, v_cache, cos_table, sin_tabl
     for i in range(config.num_hidden_layers):
         p = f"model.layers.{i}."
         h = rmsnorm(x, weights[p + "input_layernorm.weight"], config.rms_norm_eps)
-        # group query heads by their KV head instead of copying K/V with repeat_interleave
+        # group query heads by their KV head
         q = linear(h, weights, p + "self_attn.q_proj.weight", weights[p + "self_attn.q_proj.bias"]).view(S, KV, H // KV, D)
         k = linear(h, weights, p + "self_attn.k_proj.weight", weights[p + "self_attn.k_proj.bias"]).view(S, KV, D)
         v = linear(h, weights, p + "self_attn.v_proj.weight", weights[p + "self_attn.v_proj.bias"]).view(S, KV, D)

@@ -6,12 +6,13 @@ from src.loader import load_weights
 from src.config import ModelConfig
 from src.generate import greedy_cached
 from src.batching import BatchEngine
+from src.quantize import quantize_model
 
 assert torch.cuda.is_available(), "batching needs a GPU"
 tok = AutoTokenizer.from_pretrained("model")
 cfg = ModelConfig.from_json("model/config.json")
-weights = load_weights("model/model.safetensors", "cuda")
-engine = BatchEngine(weights, cfg, slots=4)
+fp32 = load_weights("model/model.safetensors", "cuda")
+int8 = quantize_model(fp32)
 
 prompts = [
     "Write a story about the ocean.",
@@ -27,19 +28,21 @@ ids = [tok(tok.apply_chat_template([{"role": "user", "content": p}], tokenize=Fa
 N = 80
 
 # 6 requests on 4 slots, so two have to wait and join mid-batch
-results = [None] * len(ids)
-def run(i):
-    results[i] = list(engine.submit(ids[i], N, 0.0, 1.0))
-threads = [threading.Thread(target=run, args=(i,)) for i in range(len(ids))]
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
+for name, weights in [("fp32", fp32), ("int8", int8)]:
+    engine = BatchEngine(weights, cfg, slots=4)
+    results = [None] * len(ids)
+    def run(i):
+        results[i] = list(engine.submit(ids[i], N, 0.0, 1.0))
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(ids))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-for i, x in enumerate(ids):
-    ref = greedy_cached(x, weights, cfg, max_new_tokens=N)[0, x.shape[1]:].tolist()
-    assert results[i] == ref, f"prompt {i}: batched output differs from greedy_cached"
-    print(f"prompt {i}: {len(ref)} tokens match greedy_cached")
+    for i, x in enumerate(ids):
+        ref = greedy_cached(x, weights, cfg, max_new_tokens=N)[0, x.shape[1]:].tolist()
+        assert results[i] == ref, f"{name} prompt {i}: batched output differs from greedy_cached"
+    print(f"{name}: {len(ids)} batched requests match greedy_cached")
 
 try:
     engine.submit(ids[0], 5000, 0.0, 1.0)

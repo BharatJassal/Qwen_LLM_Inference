@@ -1,6 +1,6 @@
 # Qwen LLM Inference
 
-Built an inference engine for **Qwen2.5-0.5B-Instruct** from scratch, developed in pure PyTorch by loading raw `safetensors` weights directly, without using `transformers`. Implemented the Llama architecture (RoPE, GQA, SwiGLU, RMSNorm), autoregressive decoding with sampling, and KV caching, verifying each component against HuggingFace. On NVIDIA GPUs, decoding runs a custom fused INT8 GEMV CUDA kernel and replays each token from a CUDA graph: **147.8 tok/s INT8 on a GTX 1080 Ti, 3x the plain cached decode**. The server batches concurrent requests continuously, reaching 401 tok/s combined across 8 requests.
+Built an inference engine for **Qwen2.5-0.5B-Instruct** from scratch, developed in pure PyTorch by loading raw `safetensors` weights directly, without using `transformers`. Implemented the Llama architecture (RoPE, GQA, SwiGLU, RMSNorm), autoregressive decoding with sampling, and KV caching, verifying each component against HuggingFace. On NVIDIA GPUs, decoding runs a custom fused INT8 GEMV CUDA kernel and replays each token from a CUDA graph: **147.8 tok/s INT8 on a GTX 1080 Ti, 3x the plain cached decode**. The server batches concurrent requests continuously on INT8 weights, reaching 435 tok/s combined across 8 requests.
 
 
 ## Purpose
@@ -12,10 +12,11 @@ Modern LLM stacks such as vLLM, llama.cpp and more hide the complexity involved 
 | Check | Method | Result |
 |---|---|---|
 | End to end logits | Max abs. deviation vs HuggingFace reference, fp32 | 6.08e-05, gate: < 1e-3 |
-| Layer components | Forward hooks on reference model, layer 0 | RMSNorm, attention, MLP all < 1e-5 |
+| Layer components | Forward hooks on reference model, layer 0 | RMSNorm, attention, MLP all < 1e-4 |
 | KV cache | Greedy decode, cached vs uncached, 300 token generation | Token-for-token identical |
-| INT8 CUDA kernel | Every layer-0 projection vs dequantize + matmul; 200 token greedy decode | Max rel. error 2.6e-07; token-for-token identical |
+| INT8 CUDA kernel | Every layer-0 projection, batch 1 to 8, vs dequantize + matmul; 200 token greedy decode | Max rel. error 4.1e-07; token-for-token identical |
 | CUDA graph decode | 300 token greedy and 100 token seeded sampling, graph vs cached, FP32 and INT8 | Token-for-token identical |
+| Continuous batching | 6 greedy requests on 4 slots vs `greedy_cached`, FP32 and INT8 | Token-for-token identical |
 
 ### Throughput (KV-cache impact)
 
@@ -41,14 +42,16 @@ Linear layer weights are quantized using per channel symmetric INT8 and dequanti
 |---|---|---|---|
 | Quantized tensors | 1365.0 MB | 342.41 MB | 3.99x reduction |
 | Whole model | 1884.59 MB | 862.00 MB | 2.19x reduction |
-| Perplexity | 20.8487 | 20.8605 | +0.06% |
+| Perplexity, story text, 300 tokens | 12.8151 | 12.9054 | +0.71% |
+| Perplexity, story text, 1024 tokens | 14.4113 | 14.5161 | +0.73% |
+| Perplexity, story text, 2048 tokens | 14.8940 | 14.9574 | +0.43% |
 
-Measured on Project Gutenberg ebook 1342 (*Pride and Prejudice*).
+Measured on Project Gutenberg ebook 1342 (*Pride and Prejudice*), starting at Chapter 1. INT8 costs under 1% perplexity. `benchmark_quantized` itself reads the first 300 tokens of the file, which are the Gutenberg license header, so it reports a lower 7.1541 FP32 / 7.1433 INT8. On a GPU it also runs the text one token at a time through the fused kernel and gets the same INT8 perplexity to 4 decimals.
 
 The reason why the whole model reduction is only 2.19x instead of 4x is because `embed_tokens.weight` matrix 
 (151936 x 896, ~519 MB in fp32) is left unquantized. Because the model uses tied embeddings, any quantization error here degrades the input token representation and the final logit prediction. At this model size the embedding is a large fraction of total parameters, but in larger models it is negligible and the whole model int8 approaches the full 4x.
 
-On CPU (and for prompt processing on GPU), weights dequantize to FP32 right before `torch.matmul`, which keeps the full RAM savings in plain PyTorch but costs speed. On an NVIDIA GPU, single-token decode instead calls a fused INT8 kernel that never dequantizes, described below.
+On CPU (and for prompt processing on GPU), weights dequantize to FP32 right before `torch.matmul`, which keeps the full RAM savings in plain PyTorch but costs speed. On an NVIDIA GPU, decode (up to 8 tokens per call, one per request in a batch) instead calls a fused INT8 kernel that never dequantizes, described below.
 
 ## GPU: fused INT8 kernel and CUDA graphs
 
@@ -74,6 +77,22 @@ Final kernel vs cuBLAS FP32 GEMV, median of 3 runs:
 
 q/o gains least because at ~6 µs it is close to the ~5 µs cost of launching an empty kernel. Tried and dropped on top of v3: 16-byte weight loads (slower, because the matching `x` reads scatter), staging `x` in shared memory (mixed), and `#pragma unroll` (no change).
 
+#### Batched kernel
+
+With continuous batching, each step multiplies every weight matrix by up to 8 vectors, one per active request. Running the kernel 8 times would read the weights 8 times, so the kernel takes a batch: each warp loads a weight row once and accumulates it against every input, with the batch size as a template parameter so the 8 partial sums stay in registers. Each row's arithmetic is identical to a batch of 1, so a request gets bit-identical results whether it runs alone or in a batch.
+
+µs per call, median of 3 runs ([`benchmark/bench_int8_batch.py`](benchmark/bench_int8_batch.py)):
+
+| Shape | Batch | INT8 kernel | Dequantize + matmul | cuBLAS FP32 |
+|---|---|---|---|---|
+| gate/up | 1 | 18.14 | 241.74 | 55.94 |
+| gate/up | 8 | 70.11 | 263.26 | 79.63 |
+| down | 1 | 18.27 | 252.73 | 53.80 |
+| down | 8 | 62.24 | 288.55 | 101.59 |
+| q/o | 8 | 13.45 | 64.59 | 22.81 |
+
+The INT8 advantage shrinks as the batch grows: at batch 8 the kernel is doing 8x the math on each weight byte and stops being purely memory bound. It still beats FP32 at every size, and is about 4x faster than dequantizing, which is what batched INT8 used before.
+
 ### CUDA graphs
 
 A 3x faster kernel barely changed end-to-end speed at first: INT8 decode was still slower than FP32. Profiling showed why. Each token launches ~1100 small GPU operations, and the GPU sat idle about half the time waiting for Python to launch the next one.
@@ -96,7 +115,7 @@ Timings include prompt processing and graph capture. With launch overhead gone, 
 
 ## Serving
 
-The engine is served through a FastAPI app with token level streaming and a browser chat UI. On a GPU, requests go through a continuous batching engine. On CPU, a lock runs them one at a time.
+The engine is served through a FastAPI app with token level streaming and a browser chat UI. On a GPU, requests go through a continuous batching engine, with INT8 weights when the kernel builds and FP32 otherwise. On CPU, a lock runs them one at a time on FP32 weights.
 
 ```bash
 uvicorn src.app:app --port 8000
@@ -114,15 +133,18 @@ Before batching, the GPU served one request at a time, so 8 clients meant the la
 - Each step is one CUDA graph replay over all active slots, using the same batched `decode_step` as the single request path. Graphs are captured once at startup for batch sizes 1, 2, 4 and 8, and each step uses the smallest one that covers the active slots. A single request doesn't pay for 8.
 - Each request keeps its own temperature and top-p, since tokens are picked outside the graph.
 
-Aggregate throughput, 100 greedy tokens per request, FP32, median of 3 runs ([`benchmark/bench_batching.py`](benchmark/bench_batching.py)):
+Aggregate throughput, 100 greedy tokens per request, median of 3 runs ([`benchmark/bench_batching.py`](benchmark/bench_batching.py)):
 
-| Concurrent requests | One at a time (tok/s) | Batched (tok/s) | Speedup |
-|---|---|---|---|
-| 1 | 98.1 | 88.1 | 0.90x |
-| 4 | 98.0 | 285.4 | 2.91x |
-| 8 | 97.9 | 401.0 | 4.10x |
+| Weights | Concurrent requests | One at a time (tok/s) | Batched (tok/s) | Speedup |
+|---|---|---|---|---|
+| FP32 | 1 | 100.8 | 92.5 | 0.90x |
+| FP32 | 4 | 99.6 | 291.5 | 2.89x |
+| FP32 | 8 | 96.5 | 398.6 | 4.18x |
+| INT8 | 1 | 144.8 | 129.7 | 0.88x |
+| INT8 | 4 | 145.9 | 335.9 | 2.29x |
+| INT8 | 8 | 147.0 | **434.7** | 3.01x |
 
-Decoding is limited by reading the weights from memory, and a batch reads them once for all its requests, so throughput grows with batch size. A lone request is about 10% slower than the dedicated single request path because it attends over the full 2048 token cache slot.
+Decoding is limited by reading the weights from memory, and a batch reads them once for all its requests, so throughput grows with batch size. INT8 gains less from batching because each step already reads 4x fewer weight bytes, but it stays ahead of FP32 at every load (1.40x for one request, 1.09x for eight) with a quarter of the weight memory. A lone request is about 10% slower than the dedicated single request path because it attends over the full 2048 token cache slot.
 
 ### Load test
 
@@ -134,7 +156,7 @@ All requests fired simultaneously via `asyncio.gather` ([`benchmark/bench_app.py
 | 4 | 2.50 | 2.68 | 1.49 | 2.00 | 2.00 | 2.00 |
 | 8 | 5.01 | 6.77 | 1.18 | 2.90 | 2.91 | 2.75 |
 
-With batching, p95 at 8 clients drops from 6.77 s to 2.91 s and p50 matches p95, since nobody waits in line. Single client numbers swing a lot between runs (0.47 to 1.54 s) because requests sample at temperature 0.7 and stop at end of sequence, so reply length changes from run to run. The token based benchmark above is the cleaner comparison.
+With batching, p95 at 8 clients drops from 6.77 s to 2.91 s and p50 matches p95, since nobody waits in line. Serving INT8 instead of FP32 brings that to 2.78 s, and 1 and 4 clients to 1.22 s and 1.81 s p50 (2.87 req/s at 8 clients). Single client numbers swing a lot between runs (0.47 to 1.54 s) because requests sample at temperature 0.7 and stop at end of sequence, so reply length changes from run to run. The token based benchmark above is the cleaner comparison.
 
 CPU, 50-token generations:
 
@@ -174,7 +196,7 @@ python -m benchmark.benchmark
 
 ### GPU kernel and CUDA graphs (NVIDIA only)
 
-The INT8 extension compiles on first use, so it needs the CUDA Toolkit 12.6, C++ compiler (Windows: Visual Studio 2022 Build Tools) and `ninja` (in `requirements.txt`). On Windows, run from a VS developer shell with the venv activated:
+The INT8 extension compiles on first use, so it needs the CUDA Toolkit 12.6, C++ compiler (Windows: Visual Studio 2022 Build Tools) and `ninja` (in `requirements.txt`). If the build fails, it prints a warning and INT8 falls back to dequantize (and the app to FP32) instead of crashing. On Windows, run from a VS developer shell with the venv activated:
 
 ```powershell
 & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
@@ -182,11 +204,13 @@ The INT8 extension compiles on first use, so it needs the CUDA Toolkit 12.6, C++
 python -m tests.test_int8_kernel
 python -m tests.test_graph
 python -m tests.test_batching
+python -m tests.test_ext_fallback
 python -m benchmark.bench_int8_speed
+python -m benchmark.bench_int8_batch
 python -m benchmark.bench_batching
 ```
 
-`test_int8_kernel` checks the kernel against dequantize + matmul on every projection shape and that decoding with and without it gives identical tokens. `test_graph` checks graph decoding (greedy and seeded sampling, FP32 and INT8) is token for token identical to the cached path. `test_batching` runs 6 greedy requests through a 4 slot engine and checks each one matches `greedy_cached`, then checks over-long requests are rejected and cancelled requests free their slots. `bench_int8_speed` times FP32 and INT8 decoding, with and without CUDA graphs. `bench_batching` compares batched and one at a time throughput.
+`test_int8_kernel` checks the kernel against dequantize + matmul on every projection shape at batch 1 to 8, that a batched row matches the same row run alone bit for bit, and that decoding with and without it gives identical tokens. `test_ext_fallback` fakes a failed build and checks INT8 layers still work through dequantize. `test_graph` checks graph decoding (greedy and seeded sampling, FP32 and INT8) is token for token identical to the cached path. `test_batching` runs 6 greedy requests through a 4 slot engine, FP32 and INT8, and checks each one matches `greedy_cached`, then checks over-long requests are rejected and cancelled requests free their slots. `bench_int8_speed` times FP32 and INT8 decoding, with and without CUDA graphs. `bench_int8_batch` times the kernel at batch 1 to 8 against dequantize and cuBLAS. `bench_batching` compares batched and one at a time throughput, FP32 and INT8.
 
 The standalone kernel harness in [`cuda/int8_gemv.cu`](cuda/int8_gemv.cu) checks the kernel against a CPU reference and times it against cuBLAS (`-arch=sm_61` targets the GTX 1080 Ti; change it for your GPU):
 

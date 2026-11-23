@@ -113,3 +113,46 @@ With a single 8 slot graph (before per-size graphs) a lone request ran at 58.0 t
 | 4 | 2.04 / 2.04 / 2.04 / 1.96 | 1.90 / 1.90 / 1.90 / 2.10 | 2.00 / 2.00 / 2.00 / 2.00 | 2.00 / 2.00 / 2.00 / 2.00 |
 | 8 | 2.90 / 2.91 / 2.91 / 2.75 | 2.76 / 2.76 / 2.76 / 2.90 | 3.00 / 3.01 / 3.01 / 2.66 | 2.90 / 2.91 / 2.91 / 2.75 |
 
+
+## Batched INT8 kernel and build fallback (2026-11-23)
+- int8_ext.available() now tries the build once and returns False (with a warning) when it fails, instead of crashing on the first INT8 call. tests.test_ext_fallback passes; in a shell without ninja on PATH the app logged the warning and served FP32.
+- cuda/int8_gemv_ext.cu takes x as (cols) or (batch, cols), batch 1 to 8, templated on batch so each warp loads a weight row once for all inputs. Batch 1 does the same arithmetic as v3.
+- tests.test_int8_kernel: every layer-0 projection at batch 2 to 8 within 1e-5 rel of dequantize + matmul, each batched row bit-identical to running that row alone, batch 9 and cols not matching rejected, 200 token decode identical
+- tests.test_batching: 6 greedy requests on 4 slots identical to greedy_cached for FP32 and INT8 engines. test_graph, test_sample, test_HF still pass.
+- benchmark_quantized perplexity, first 300 tokens of the gutenberg.txt on this PC: fp32 5.4849, int8 full forward 5.4388, int8 token by token through the fused kernel 5.4388. This PC's gutenberg.txt is Frankenstein (ebook 84), whose first 300 tokens are the Project Gutenberg license header, not Pride and Prejudice (ebook 1342) as used for the README's 20.8487 / 20.8605, so the two are not comparable. The point here is that the kernel path matches the full forward on the same text.
+
+## Perplexity re-measured on Pride and Prejudice (2026-11-23)
+- gutenberg.txt replaced with pg1342.txt (772,386 bytes) from the official mirror gutenberg.pglaf.org (gutenberg.org was down for maintenance). Old Frankenstein file kept outside the repo.
+- benchmark_quantized as is (first 300 tokens = license header): fp32 7.1541, int8 7.1433, int8 through kernel 7.1433 on GPU; CPU fp32 7.1540, int8 7.1428
+- The README's July 20.8487 / 20.8605 could not be reproduced. First 300 tokens of other versions, fp32: 1342-0.txt 33.43, text after the START marker 34.58, from Chapter I heading 10.17, from the opening line 12.82, HTML 2.92 to 3.58, CRLF line endings 6.69. None is 20.85, so the July input is unknown.
+- Story text from Chapter 1's opening line (fp32 / int8 / change): 300 tokens 12.8151 / 12.9054 / +0.71%, 1024 tokens 14.4113 / 14.5161 / +0.73%, 2048 tokens 14.8940 / 14.9574 / +0.43%. int8 through the kernel on the 300 token slice: 12.9054 (kernel confirmed built).
+- bench_int8_batch, µs per call, 3 runs, median (kernel / dequantize + F.linear / FP32 cuBLAS):
+
+| Projection | Batch 1 | Batch 2 | Batch 4 | Batch 8 |
+|---|---|---|---|---|
+| gate/up 4864x896 | 18.14 / 241.74 / 55.94 | 22.99 / 240.07 / 57.75 | 39.51 / 241.40 / 57.10 | 70.11 / 263.26 / 79.63 |
+| down 896x4864 | 18.27 / 252.73 / 53.80 | 24.24 / 250.65 / 55.38 | 35.00 / 240.74 / 56.81 | 62.24 / 288.55 / 101.59 |
+| q/o 896x896 | 11.16 / 54.44 / 13.28 | 10.65 / 54.86 / 13.44 | 10.96 / 55.52 / 14.20 | 13.45 / 64.59 / 22.81 |
+
+Raw runs, kernel gate b1..b8: 19.92 27.98 42.41 70.11 | 18.14 22.99 39.51 75.93 | 17.30 20.90 34.32 66.50
+
+- bench_batching, 100 greedy tokens per request, 3 runs, tok/s (one at a time / batched):
+
+| Weights | Requests | Run 1 | Run 2 | Run 3 | Median speedup |
+|---|---|---|---|---|---|
+| FP32 | 1 | 103.2 / 92.5 | 100.8 / 94.9 | 99.2 / 88.9 | 0.90x |
+| FP32 | 4 | 99.6 / 296.6 | 101.0 / 291.5 | 98.9 / 282.4 | 2.89x |
+| FP32 | 8 | 96.5 / 418.4 | 101.3 / 389.8 | 95.3 / 398.6 | 4.18x |
+| INT8 | 1 | 144.8 / 130.1 | 149.1 / 129.7 | 140.4 / 123.7 | 0.88x |
+| INT8 | 4 | 149.9 / 343.3 | 145.9 / 335.9 | 138.7 / 315.7 | 2.29x |
+| INT8 | 8 | 149.6 / 434.7 | 147.0 / 442.1 | 142.1 / 428.6 | 3.01x |
+
+Before the batched kernel, the INT8 engine would fall back to dequantize for batch > 1 (about 240 µs per gate/up call), which is why the app served FP32.
+
+- App now quantizes when the kernel is available. bench_app, INT8 batched app, 3 runs (p50 / p95 / wall / req/s):
+
+| Clients | Run 1 | Run 2 | Run 3 | Median per column |
+|---|---|---|---|---|
+| 1 | 1.33 / 1.33 / 1.33 / 0.75 | 1.22 / 1.22 / 1.22 / 0.82 | 0.44 / 0.44 / 0.44 / 2.25 | 1.22 / 1.22 / 1.22 / 0.82 |
+| 4 | 1.83 / 1.83 / 1.83 / 2.19 | 1.81 / 1.81 / 1.81 / 2.21 | 1.03 / 1.64 / 1.64 / 2.44 | 1.81 / 1.81 / 1.81 / 2.21 |
+| 8 | 2.88 / 2.88 / 2.88 / 2.77 | 2.78 / 2.78 / 2.79 / 2.87 | 2.71 / 2.72 / 2.72 / 2.94 | 2.78 / 2.78 / 2.79 / 2.87 |

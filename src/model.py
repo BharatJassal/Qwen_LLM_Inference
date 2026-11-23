@@ -30,7 +30,7 @@ def forward(token_ids, weights, config, cache=None):
         weights["model.norm.weight"],
         config.rms_norm_eps
     )
-    logits = F.linear(x, weights["model.embed_tokens.weight"])
+    logits = linear(x, weights, "model.embed_tokens.weight")
 
     return logits, cache
 
@@ -65,4 +65,4 @@ def decode_step(tok, pos, weights, config, k_cache, v_cache, cos_table, sin_tabl
         x = x + mlp(h, weights, i)
 
     x = rmsnorm(x, weights["model.norm.weight"], config.rms_norm_eps)
-    return F.linear(x, weights["model.embed_tokens.weight"])
+    return linear(x, weights, "model.embed_tokens.weight")

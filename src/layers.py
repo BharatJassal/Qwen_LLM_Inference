@@ -22,8 +22,10 @@ def linear(x, weights, key, bias=None):
     return F.linear(x, get_weight(weights, key), bias)
 
 def embedding(token_ids, embed_weight):
-    embed_tokens = embed_weight[token_ids]
-    return embed_tokens
+    if isinstance(embed_weight, tuple):
+        w_int8, scales = embed_weight
+        return w_int8[token_ids].float() * scales[token_ids]
+    return embed_weight[token_ids]
 
 def rmsnorm(x, weight, eps):
     squared = x * x

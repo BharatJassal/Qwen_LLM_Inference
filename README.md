@@ -1,6 +1,6 @@
 # Qwen LLM Inference
 
-Built an inference engine for **Qwen2.5-0.5B-Instruct** from scratch, developed in pure PyTorch by loading raw `safetensors` weights directly, without using `transformers`. Implemented the Llama architecture (RoPE, GQA, SwiGLU, RMSNorm), autoregressive decoding with sampling, and KV caching, verifying each component against HuggingFace. On NVIDIA GPUs, decoding runs a custom fused INT8 GEMV CUDA kernel and replays each token from a CUDA graph: **147.8 tok/s INT8 on a GTX 1080 Ti, 3x the plain cached decode**. The server batches concurrent requests continuously on INT8 weights, reaching 435 tok/s combined across 8 requests.
+Built an inference engine for **Qwen2.5-0.5B-Instruct** from scratch, developed in pure PyTorch by loading raw `safetensors` weights directly, without using `transformers`. Implemented the Llama architecture (RoPE, GQA, SwiGLU, RMSNorm), autoregressive decoding with sampling, and KV caching, verifying each component against HuggingFace. On NVIDIA GPUs, decoding runs a custom fused INT8 GEMV CUDA kernel and replays each token from a CUDA graph: **195.7 tok/s INT8 on a GTX 1080 Ti, 1.8x FP32**. The server batches concurrent requests continuously on INT8 weights, reaching 466 tok/s combined across 8 requests.
 
 
 ## Purpose
@@ -36,20 +36,19 @@ Without KV caching, every new token requires a full forward pass over the entire
 
 ### INT8 Quantization
 
-Linear layer weights are quantized using per channel symmetric INT8 and dequantized back to FP32 right before each matrix multiplication. Layer norms, biases, and embedding tables stay in FP32.
+Linear layer weights and the embedding table are quantized using per channel symmetric INT8: each row gets one FP32 scale, `scale = max|row| / 127`, and stores `round(w / scale)`. Layer norms and biases stay in FP32.
 
 | Measurement | fp32 | int8 | Change |
 |---|---|---|---|
-| Quantized tensors | 1365.0 MB | 342.41 MB | 3.99x reduction |
-| Whole model | 1884.59 MB | 862.00 MB | 2.19x reduction |
-| Perplexity, story text, 300 tokens | 12.8151 | 12.9054 | +0.71% |
-| Perplexity, story text, 1024 tokens | 14.4113 | 14.5161 | +0.73% |
-| Perplexity, story text, 2048 tokens | 14.8940 | 14.9574 | +0.43% |
+| Quantized tensors | 1884.31 MB | 472.82 MB | 3.99x reduction |
+| Whole model | 1884.59 MB | 473.09 MB | 3.98x reduction |
+| Perplexity, story text, 300 tokens | 12.8151 | 12.8968 | +0.64% |
+| Perplexity, story text, 1024 tokens | 14.4113 | 14.5206 | +0.76% |
+| Perplexity, story text, 2048 tokens | 14.8940 | 14.9675 | +0.49% |
 
-Measured on Project Gutenberg ebook 1342 (*Pride and Prejudice*), starting at Chapter 1. INT8 costs under 1% perplexity. `benchmark_quantized` itself reads the first 300 tokens of the file, which are the Gutenberg license header, so it reports a lower 7.1541 FP32 / 7.1433 INT8. On a GPU it also runs the text one token at a time through the fused kernel and gets the same INT8 perplexity to 4 decimals.
+Measured on Project Gutenberg ebook 1342 (*Pride and Prejudice*), starting at Chapter 1. INT8 costs under 1% perplexity. `benchmark_quantized` itself reads the first 300 tokens of the file, which are the Gutenberg license header, so it reports a lower 7.1541 FP32 / 7.1538 INT8. On a GPU it also runs the text one token at a time through the fused kernel and gets the same INT8 perplexity to 4 decimals.
 
-The reason why the whole model reduction is only 2.19x instead of 4x is because `embed_tokens.weight` matrix 
-(151936 x 896, ~519 MB in fp32) is left unquantized. Because the model uses tied embeddings, any quantization error here degrades the input token representation and the final logit prediction. At this model size the embedding is a large fraction of total parameters, but in larger models it is negligible and the whole model int8 approaches the full 4x.
+The embedding table (151936 x 896, ~519 MB in FP32) is over a quarter of the model, and because Qwen ties its embeddings it doubles as the output layer that turns the final hidden state into a score for every token. Quantizing it was the last FP32 matrix left, so it takes the whole model from 2.19x to 3.98x smaller. A lookup reads the token's INT8 row and multiplies by its scale; the output layer runs through the same kernel as every other projection. Since one tensor feeds both the input and the logits, its rounding error shows up twice, but perplexity moved less than 0.1 points against the previous INT8 numbers (+0.71/+0.73/+0.43% with an FP32 embedding).
 
 On CPU (and for prompt processing on GPU), weights dequantize to FP32 right before `torch.matmul`, which keeps the full RAM savings in plain PyTorch but costs speed. On an NVIDIA GPU, decode (up to 8 tokens per call, one per request in a batch) instead calls a fused INT8 kernel that never dequantizes, described below.
 
@@ -107,11 +106,13 @@ A 3x faster kernel barely changed end-to-end speed at first: INT8 decode was sti
 
 | Weights | Cached decode (tok/s) | Cached + CUDA graph (tok/s) | Graph speedup |
 |---|---|---|---|
-| FP32 | 51.6 | 102.6 | 2.0x |
-| INT8, dequantize every call | 30.4 | n/a | n/a |
-| INT8, fused kernel | 48.9 | **147.8** | 3.0x |
+| FP32 | 58.0 | 108.4 | 1.9x |
+| INT8 kernel, FP32 output layer (1 run) | 54.1 | 161.5 | 3.0x |
+| INT8 kernel, INT8 output layer | 60.0 | **195.7** | 3.3x |
 
-Timings include prompt processing and graph capture. With launch overhead gone, the kernel's savings finally show end to end: INT8 is 1.44x faster than FP32, where it was slower before.
+Timings include prompt processing and graph capture. With launch overhead gone, the kernel's savings show end to end: INT8 is 1.8x faster than FP32. Dequantizing on every call instead of using the kernel ran at about 30 tok/s.
+
+Quantizing the output layer cut the weight bytes read per token from ~904 MB to ~496 MB (1.82x), but speed rose only 1.21x. At 195.7 tok/s the GPU streams ~97 GB/s of weights, about 20% of its 484 GB/s peak, so weight bytes are no longer the main cost per token.
 
 ## Serving
 
@@ -137,14 +138,14 @@ Aggregate throughput, 100 greedy tokens per request, median of 3 runs ([`benchma
 
 | Weights | Concurrent requests | One at a time (tok/s) | Batched (tok/s) | Speedup |
 |---|---|---|---|---|
-| FP32 | 1 | 100.8 | 92.5 | 0.90x |
-| FP32 | 4 | 99.6 | 291.5 | 2.89x |
-| FP32 | 8 | 96.5 | 398.6 | 4.18x |
-| INT8 | 1 | 144.8 | 129.7 | 0.88x |
-| INT8 | 4 | 145.9 | 335.9 | 2.29x |
-| INT8 | 8 | 147.0 | **434.7** | 3.01x |
+| FP32 | 1 | 105.9 | 96.9 | 0.92x |
+| FP32 | 4 | 105.8 | 317.2 | 3.00x |
+| FP32 | 8 | 105.8 | 442.2 | 4.19x |
+| INT8 | 1 | 185.2 | 151.1 | 0.81x |
+| INT8 | 4 | 178.7 | 360.4 | 2.02x |
+| INT8 | 8 | 177.0 | **466.0** | 2.62x |
 
-Decoding is limited by reading the weights from memory, and a batch reads them once for all its requests, so throughput grows with batch size. INT8 gains less from batching because each step already reads 4x fewer weight bytes, but it stays ahead of FP32 at every load (1.40x for one request, 1.09x for eight) with a quarter of the weight memory. A lone request is about 10% slower than the dedicated single request path because it attends over the full 2048 token cache slot.
+Decoding is limited by reading the weights from memory, and a batch reads them once for all its requests, so throughput grows with batch size. INT8 gains less from batching because each step already reads 4x fewer weight bytes, but it stays ahead of FP32 at every load (1.56x for one request, 1.05x for eight) with a quarter of the weight memory. A lone request is about 18% slower than the dedicated single request path because it attends over the full 2048 token cache slot, a fixed cost that weighs more now that the rest of the step is faster.
 
 ### Load test
 
@@ -156,7 +157,7 @@ All requests fired simultaneously via `asyncio.gather` ([`benchmark/bench_app.py
 | 4 | 2.50 | 2.68 | 1.49 | 2.00 | 2.00 | 2.00 |
 | 8 | 5.01 | 6.77 | 1.18 | 2.90 | 2.91 | 2.75 |
 
-With batching, p95 at 8 clients drops from 6.77 s to 2.91 s and p50 matches p95, since nobody waits in line. Serving INT8 instead of FP32 brings that to 2.78 s, and 1 and 4 clients to 1.22 s and 1.81 s p50 (2.87 req/s at 8 clients). Single client numbers swing a lot between runs (0.47 to 1.54 s) because requests sample at temperature 0.7 and stop at end of sequence, so reply length changes from run to run. The token based benchmark above is the cleaner comparison.
+With batching, p95 at 8 clients drops from 6.77 s to 2.91 s and p50 matches p95, since nobody waits in line. Serving INT8 before the output layer was quantized brings that to 2.78 s, and 1 and 4 clients to 1.22 s and 1.81 s p50 (2.87 req/s at 8 clients). Single client numbers swing a lot between runs (0.47 to 1.54 s) because requests sample at temperature 0.7 and stop at end of sequence, so reply length changes from run to run. The token based benchmark above is the cleaner comparison.
 
 CPU, 50-token generations:
 

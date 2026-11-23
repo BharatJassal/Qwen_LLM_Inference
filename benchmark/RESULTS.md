@@ -78,7 +78,7 @@ Both endpoints share one threading.Lock (stream endpoint had none; concurrent gr
 | 4 | 3.36 | 3.85 | 3.85 | 1.04 |
 | 8 | 4.09 | 5.91 | 5.92 | 1.35 |
 
-## Reruns for medians (2026-11-20)
+## Reruns for medians
 - INT8 dequantize every call (layers.USE_FUSED = False), greedy_cached 300 tokens, 3 runs: 30.4 / 30.3 / 30.5 tok/s, median 30.4 (earlier single run: 28.3)
 - bench_app, GPU, FP32, CUDA graphs, 3 more runs (p50 / p95 / wall / req/s):
 
@@ -114,14 +114,14 @@ With a single 8 slot graph (before per-size graphs) a lone request ran at 58.0 t
 | 8 | 2.90 / 2.91 / 2.91 / 2.75 | 2.76 / 2.76 / 2.76 / 2.90 | 3.00 / 3.01 / 3.01 / 2.66 | 2.90 / 2.91 / 2.91 / 2.75 |
 
 
-## Batched INT8 kernel and build fallback (2026-11-23)
+## Batched INT8 kernel and build fallback
 - int8_ext.available() now tries the build once and returns False (with a warning) when it fails, instead of crashing on the first INT8 call. tests.test_ext_fallback passes; in a shell without ninja on PATH the app logged the warning and served FP32.
 - cuda/int8_gemv_ext.cu takes x as (cols) or (batch, cols), batch 1 to 8, templated on batch so each warp loads a weight row once for all inputs. Batch 1 does the same arithmetic as v3.
 - tests.test_int8_kernel: every layer-0 projection at batch 2 to 8 within 1e-5 rel of dequantize + matmul, each batched row bit-identical to running that row alone, batch 9 and cols not matching rejected, 200 token decode identical
 - tests.test_batching: 6 greedy requests on 4 slots identical to greedy_cached for FP32 and INT8 engines. test_graph, test_sample, test_HF still pass.
 - benchmark_quantized perplexity, first 300 tokens of the gutenberg.txt on this PC: fp32 5.4849, int8 full forward 5.4388, int8 token by token through the fused kernel 5.4388. This PC's gutenberg.txt is Frankenstein (ebook 84), whose first 300 tokens are the Project Gutenberg license header, not Pride and Prejudice (ebook 1342) as used for the README's 20.8487 / 20.8605, so the two are not comparable. The point here is that the kernel path matches the full forward on the same text.
 
-## Perplexity re-measured on Pride and Prejudice (2026-11-23)
+## Perplexity remeasured on Pride and Prejudice
 - gutenberg.txt replaced with pg1342.txt (772,386 bytes) from the official mirror gutenberg.pglaf.org (gutenberg.org was down for maintenance). Old Frankenstein file kept outside the repo.
 - benchmark_quantized as is (first 300 tokens = license header): fp32 7.1541, int8 7.1433, int8 through kernel 7.1433 on GPU; CPU fp32 7.1540, int8 7.1428
 - The README's July 20.8487 / 20.8605 could not be reproduced. First 300 tokens of other versions, fp32: 1342-0.txt 33.43, text after the START marker 34.58, from Chapter I heading 10.17, from the opening line 12.82, HTML 2.92 to 3.58, CRLF line endings 6.69. None is 20.85, so the July input is unknown.
@@ -156,3 +156,30 @@ Before the batched kernel, the INT8 engine would fall back to dequantize for bat
 | 1 | 1.33 / 1.33 / 1.33 / 0.75 | 1.22 / 1.22 / 1.22 / 0.82 | 0.44 / 0.44 / 0.44 / 2.25 | 1.22 / 1.22 / 1.22 / 0.82 |
 | 4 | 1.83 / 1.83 / 1.83 / 2.19 | 1.81 / 1.81 / 1.81 / 2.21 | 1.03 / 1.64 / 1.64 / 2.44 | 1.81 / 1.81 / 1.81 / 2.21 |
 | 8 | 2.88 / 2.88 / 2.88 / 2.77 | 2.78 / 2.78 / 2.79 / 2.87 | 2.71 / 2.72 / 2.72 / 2.94 | 2.78 / 2.78 / 2.79 / 2.87 |
+
+## INT8 output layer
+- quantize_model now also quantizes model.embed_tokens.weight. It is tied, so one INT8 copy serves the embedding lookup (gather INT8 rows, multiply by their scales) and the output layer (linear, so decode goes through the kernel)
+- tests: test_int8_kernel, test_batching (fp32 and int8), test_graph, test_ext_fallback, test_HF all pass
+- benchmark_quantized: fp32 model 1884.59 MB, int8 model 473.09 MB (3.98x, was 862.00 MB / 2.19x). First 300 tokens: fp32 7.1541, int8 7.1538 (was 7.1433), int8 through kernel 7.1538
+- Story text from Chapter 1 (fp32 / int8 / change): 300 tokens 12.8151 / 12.8968 / +0.64%, 1024 tokens 14.4113 / 14.5206 / +0.76%, 2048 tokens 14.8940 / 14.9675 / +0.49%. With the FP32 embedding it was +0.71 / +0.73 / +0.43%
+- bench_int8_speed, 300 tokens, tok/s. Before the change (1 run): FP32 cached 56.9, graph 108.1, INT8 cached 54.1, graph 161.5. After (3 runs):
+
+| Run | FP32 cached | FP32 graph | INT8 cached | INT8 graph |
+|---|---|---|---|---|
+| 1 | 58.0 | 108.4 | 59.1 | 195.9 |
+| 2 | 57.8 | 108.4 | 60.0 | 195.7 |
+| 3 | 58.2 | 108.1 | 60.3 | 195.3 |
+
+- INT8 graph 161.5 to 195.7 tok/s (1.21x). Weight bytes per token went from ~904 MB to ~496 MB (1.82x), so the remaining time is not weight reads: 195.7 x 496 MB = ~97 GB/s, ~20% of the 484 GB/s peak
+- bench_batching, 100 greedy tokens per request, 3 runs, tok/s (one at a time / batched):
+
+| Weights | Requests | Run 1 | Run 2 | Run 3 | Median speedup |
+|---|---|---|---|---|---|
+| FP32 | 1 | 106.0 / 96.9 | 105.8 / 96.9 | 105.9 / 96.9 | 0.92x |
+| FP32 | 4 | 105.4 / 317.2 | 105.8 / 317.3 | 106.0 / 316.7 | 3.00x |
+| FP32 | 8 | 105.8 / 440.4 | 105.9 / 444.4 | 105.7 / 442.2 | 4.19x |
+| INT8 | 1 | 185.2 / 151.7 | 185.8 / 151.1 | 185.2 / 149.0 | 0.81x |
+| INT8 | 4 | 178.7 / 360.4 | 179.3 / 360.8 | 177.4 / 358.8 | 2.02x |
+| INT8 | 8 | 177.6 / 466.1 | 176.8 / 466.0 | 177.0 / 462.5 | 2.62x |
+
+- FP32 code did not change but measured ~10% faster than the earlier session (batched 8: 442.2 vs 398.6), so only compare numbers from the same session. bench_app was not re-run after this change

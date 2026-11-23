@@ -16,7 +16,8 @@ def dequantize_weight(w_int, scales):
 def quantize_model(weights):
     quantized = {}
     for key, value in weights.items():
-        if key.endswith("_proj.weight"):
+        # embed_tokens is tied to the output layer, this copy serves both.
+        if key.endswith("_proj.weight") or key == "model.embed_tokens.weight":
             quantized[key] = quantize_weight(value)
         else:
             quantized[key] = value

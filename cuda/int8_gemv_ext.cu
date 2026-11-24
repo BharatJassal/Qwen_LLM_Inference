@@ -12,6 +12,7 @@ template <int B>
 __global__ void int8_gemv(const int8_t* __restrict__ W,
                           const float* __restrict__ scale,
                           const float* __restrict__ x,
+                          const float* __restrict__ bias,
                           float* __restrict__ y,
                           int rows, int cols) {
     int warp = threadIdx.x / 32;
@@ -37,16 +38,17 @@ __global__ void int8_gemv(const int8_t* __restrict__ W,
             sum[b] += __shfl_down_sync(0xffffffff, sum[b], offset);
         }
         if (lane == 0) {
-            y[(size_t)b * rows + row] = scale[row] * sum[b];
+            y[(size_t)b * rows + row] = scale[row] * sum[b] + (bias ? bias[row] : 0.0f);
         }
     }
 }
 
-using Kernel = void (*)(const int8_t*, const float*, const float*, float*, int, int);
+using Kernel = void (*)(const int8_t*, const float*, const float*, const float*, float*, int, int);
 const Kernel KERNELS[MAX_BATCH] = {int8_gemv<1>, int8_gemv<2>, int8_gemv<3>, int8_gemv<4>,
                                    int8_gemv<5>, int8_gemv<6>, int8_gemv<7>, int8_gemv<8>};
 
-torch::Tensor int8_gemv_forward(torch::Tensor W, torch::Tensor scale, torch::Tensor x) {
+torch::Tensor int8_gemv_forward(torch::Tensor W, torch::Tensor scale, torch::Tensor x,
+                                c10::optional<torch::Tensor> bias) {
     TORCH_CHECK(W.is_cuda() && scale.is_cuda() && x.is_cuda(), "all tensors must be on the GPU");
     TORCH_CHECK(W.dtype() == torch::kInt8, "W must be int8");
     TORCH_CHECK(scale.dtype() == torch::kFloat32 && x.dtype() == torch::kFloat32,
@@ -64,17 +66,18 @@ torch::Tensor int8_gemv_forward(torch::Tensor W, torch::Tensor scale, torch::Ten
     TORCH_CHECK(x.size(-1) == cols, "x must have cols elements per row");
     TORCH_CHECK(batch >= 1 && batch <= MAX_BATCH, "batch must be between 1 and ", MAX_BATCH);
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned");
+    if (bias) {
+        TORCH_CHECK(bias->is_cuda() && bias->dtype() == torch::kFloat32 && bias->is_contiguous(),
+                    "bias must be a contiguous float32 GPU tensor");
+        TORCH_CHECK(bias->numel() == rows, "bias must have one value per row");
+    }
 
     auto y = x.dim() == 1 ? torch::empty({rows}, x.options()) : torch::empty({batch, rows}, x.options());
     int blocks = (rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
 
     KERNELS[batch - 1]<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         W.data_ptr<int8_t>(), scale.data_ptr<float>(),
-        x.data_ptr<float>(), y.data_ptr<float>(), rows, cols);
+        x.data_ptr<float>(), bias ? bias->data_ptr<float>() : nullptr, y.data_ptr<float>(), rows, cols);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("int8_gemv", &int8_gemv_forward, "Fused INT8 GEMV for 1 to 8 input vectors (CUDA)");
 }

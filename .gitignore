@@ -8,3 +8,5 @@ gutenberg.txt
 *.lib
 *.obj
 trace.json
+benchmark/trace_*.csv
+*.nsys-rep

@@ -43,7 +43,7 @@ def chart(results, out):
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 {height}" font-family="sans-serif" font-size="13">',
              f'<rect width="760" height="{height}" fill="#fcfcfb"/>',
              '<text x="16" y="26" font-size="15" font-weight="bold" fill="#0b0b0b">Decode speed, Qwen2.5-0.5B on a GTX 1080 Ti</text>',
-             f'<text x="16" y="44" fill="#52514e">tokens per second, one request, {NEW_TOKENS} generated tokens, higher is better</text>']
+             f'<text x="16" y="44" fill="#52514e">tok/s, one request, {NEW_TOKENS} generated tokens</text>']
     for i, (name, rate) in enumerate(rows):
         y = top + i * row
         w = rate * scale

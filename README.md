@@ -6,15 +6,13 @@ On a GTX 1080 Ti it decodes **285 tok/s with INT8 weights, 1.4x llama.cpp and 4x
 
 ![Decode speed vs Hugging Face and llama.cpp](benchmark/baselines.svg)
 
-Frameworks like vLLM and llama.cpp hide what it takes to run a model. This project rebuilds that pipeline step by step, from mapping weights to writing the GPU kernels, and profiles each step to decide the next one.
-
 **What's inside**
 
 - Llama-style architecture by hand: RoPE, grouped-query attention, SwiGLU, RMSNorm, KV cache, greedy and top-p sampling
 - Per-row INT8 quantization: 4x smaller model, under 1% perplexity cost
 - CUDA kernels: an INT8 matrix-vector kernel (batch 1 to 8), fused RMSNorm + residual add, RoPE and SiLU
 - CUDA graphs: each token is one graph replay instead of ~400 kernel launches
-- Profiling with nvprof and a bandwidth model to decide what to optimize next
+- Profiling with nvprof and a bandwidth model
 - FastAPI server with token streaming, a chat UI and continuous batching
 
 ## Architecture
@@ -42,8 +40,8 @@ flowchart TB
     layer --> OUT["INT8 GEMV output layer"] --> T["pick token, greedy or top-p<br/>feed it into the next step"]
 ```
 
-- **Grouped-query attention:** 2 KV heads serve 14 query heads; each KV head is shared across its group of 7.
-- **RoPE:** rotate-half convention with cos/sin tables precomputed from `rope_theta`. During cached decoding a new token is rotated by its absolute position.
+- **Grouped-query attention:** 2 KV heads, 14 query heads.
+- **RoPE:** rotate-half, cos/sin tables precomputed from `rope_theta`, absolute positions during cached decoding.
 - **Qwen specifics:** biases on the q, k, v projections, and tied input/output embeddings.
 
 ## Correctness
@@ -61,7 +59,7 @@ flowchart TB
 
 ## How it got fast
 
-GTX 1080 Ti (484 GB/s), Windows 11, PyTorch cu126, CUDA 12.6. 300 generated tokens, one request. Rows come from different sessions, so they can differ by a few percent from the chart above. Raw runs in [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
+GTX 1080 Ti (484 GB/s), Windows 11, PyTorch cu126, CUDA 12.6. 300 generated tokens, one request. Rows are from different sessions and can differ from the chart by a few percent. Raw runs in [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
 
 | Step | tok/s |
 |---|---|
@@ -73,15 +71,13 @@ GTX 1080 Ti (484 GB/s), Windows 11, PyTorch cu126, CUDA 12.6. 300 generated toke
 
 ### 1. KV cache
 
-Without a cache, every new token reruns the whole sequence, so n tokens cost O(n²). The cache keeps each layer's keys and values, so a new token only computes its own and attends to the stored ones, O(n) total. M4 MacBook Air, CPU:
+Without a cache, each new token reruns the forward pass over the whole sequence, so generating n tokens is O(n²). The cache stores every layer's keys and values, so each step computes q, k, v for the new token only and attends over the stored history, O(n) total. Greedy decoding on an M4 MacBook Air CPU:
 
 | Generated tokens | No cache (tok/s) | KV cache (tok/s) | Speedup |
 |---|---|---|---|
 | 30 | 7.87 | 23.4 | 3.0x |
 | 150 | 6.21 | 27.4 | 4.4x |
 | 300 | 4.07 | 26.3 | 6.4x |
-
-The speedup grows with length: the uncached cost keeps rising while the cached cost stays flat.
 
 ### 2. INT8 quantization
 
@@ -97,11 +93,11 @@ Each weight row gets one FP32 scale, `scale = max|row| / 127`, and stores `round
 
 - Perplexity is measured on *Pride and Prejudice* (Project Gutenberg 1342) from Chapter 1. `benchmark_quantized` reads the file's first 300 tokens, which are the Gutenberg license header, so it reports a lower 7.1541 FP32 / 7.1538 INT8. On a GPU it also runs the text one token at a time through the INT8 kernel and matches to 4 decimals.
 - **The embedding table** (151936 x 896, ~519 MB in FP32) is over a quarter of the model. Qwen ties it to the output layer, so one INT8 copy serves both: a lookup scales the token's INT8 row, and the output layer runs through the INT8 kernel. Quantizing it took the model from 2.19x to 3.98x smaller. Its rounding error counts twice, but perplexity moved under 0.1 points (it was +0.71 / +0.73 / +0.43% with an FP32 embedding).
-- On CPU, and for prompt processing on GPU, weights are dequantized to FP32 right before `torch.matmul`. That keeps the memory savings but not the speed. GPU decode uses the kernel below.
+- On CPU, and for prompt processing on GPU, weights are dequantized to FP32 right before `torch.matmul`. GPU decode uses the kernel below.
 
 ### 3. INT8 GEMV kernel
 
-Generating one token multiplies each weight matrix by a single vector (a GEMV), so speed is set by how fast weights stream from memory, not by math. [`int8_gemv_ext.cu`](cuda/int8_gemv_ext.cu) reads the INT8 weights directly and applies the scale once per row, `y[i] = scale[i] * sum_j W[i][j] * x[j]`, moving 4x fewer bytes than FP32.
+Decode is memory-bound: one GEMV per projection. [`int8_gemv_ext.cu`](cuda/int8_gemv_ext.cu) reads the INT8 weights directly and applies the scale once per row, `y[i] = scale[i] * sum_j W[i][j] * x[j]`, moving 4x fewer bytes than FP32.
 
 | µs per call (before projections were merged) | gate/up 4864x896 | down 896x4864 | q/o 896x896 |
 |---|---|---|---|
@@ -113,7 +109,7 @@ Generating one token multiplies each weight matrix by a single vector (a GEMV), 
 
 q/o gains least because ~6 µs is close to the ~5 µs cost of launching an empty kernel. Tried and dropped on top of v3: 16-byte weight loads (slower, the matching `x` reads scatter), staging `x` in shared memory (mixed), `#pragma unroll` (no change).
 
-**Batched kernel.** Each warp loads a weight row once and multiplies it against up to 8 input vectors, one per request, with the batch size as a template parameter so the partial sums stay in registers. Each row's math is the same as batch 1, so a request gets bit-identical results alone or batched. The kernel also adds an optional bias. µs per call on the merged shapes ([`bench_int8_batch`](benchmark/bench_int8_batch.py)):
+**Batched kernel.** Each warp loads a weight row once and multiplies it against up to 8 input vectors, with the batch size as a template parameter so the partial sums stay in registers. Results are bit-identical alone or batched. The kernel also adds an optional bias. µs per call on the merged shapes ([`bench_int8_batch`](benchmark/bench_int8_batch.py)):
 
 | Shape | Batch | INT8 kernel | Dequantize + matmul | cuBLAS FP32 |
 |---|---|---|---|---|
@@ -124,17 +120,17 @@ q/o gains least because ~6 µs is close to the ~5 µs cost of launching an empty
 | qkv 1152x896 | 1 | 9.31 | 64.15 | 15.80 |
 | qkv | 8 | 20.53 | 74.49 | 24.97 |
 
-The lead over FP32 shrinks at batch 8, where the kernel does 8x the math per weight byte and stops being purely memory-bound. It still wins at every size and is ~4x faster than dequantizing, which batched INT8 used before.
+The lead over FP32 shrinks at batch 8, where the kernel does 8x the math per weight byte. It is ~4x faster than dequantizing, which batched INT8 used before.
 
 ### 4. CUDA graphs
 
-A 3x faster kernel barely changed end-to-end speed: INT8 was still slower than FP32. Each token launched ~1100 small kernels, and the GPU sat idle most of the time waiting for Python to launch the next one.
+A 3x faster kernel barely changed end-to-end speed: INT8 was still slower than FP32. Each token launched ~1100 small kernels and the GPU sat idle waiting on Python.
 
-[`stream_graph`](src/generate.py) processes the prompt normally, then records one decode step ([`decode_step`](src/model.py)) as a CUDA graph and replays it per token: one launch instead of ~1100. A graph needs fixed shapes and memory addresses, so the decode step:
+[`stream_graph`](src/generate.py) prefills normally, then records one [`decode_step`](src/model.py) as a CUDA graph and replays it per token. Graphs need fixed shapes and addresses, so the decode step:
 
-- writes each token's K/V in place into a preallocated cache and masks unwritten slots (the regular path grows the cache with `torch.cat`);
-- builds the RoPE tables once on the GPU and indexes them with a position tensor that also lives there;
-- leaves picking the token (`argmax` or top-p) outside the graph, so sampling behaves exactly as on the regular path.
+- writes K/V in place into a preallocated cache and masks unwritten slots (the regular path uses `torch.cat`);
+- keeps the RoPE tables and the position tensor on the GPU;
+- picks the token (`argmax` or top-p) outside the graph.
 
 | 300 tokens, median of 3 | Cached decode (tok/s) | + CUDA graph (tok/s) | Graph speedup |
 |---|---|---|---|
@@ -143,7 +139,7 @@ A 3x faster kernel barely changed end-to-end speed: INT8 was still slower than F
 | INT8, before fusion | 53.3 | 189.8 | 3.6x |
 | INT8 | 80.0 | **293.4** | 3.7x |
 
-Timings include prompt processing and graph capture. INT8 is 2.2x faster than FP32; dequantizing on every call instead of using the kernel ran at 30 tok/s.
+Timings include prefill and graph capture. Dequantizing on every call instead of using the kernel ran at 30 tok/s.
 
 | INT8 decode step, nvprof trace | Step time | GPU busy | GPU idle | Kernels |
 |---|---|---|---|---|
@@ -152,15 +148,15 @@ Timings include prompt processing and graph capture. INT8 is 2.2x faster than FP
 | Without graph, after fusion | 15.09 ms | | 84% | 490 |
 | With graph, after fusion | 3.16 ms | | 11% | 397 |
 
-Tracing adds CPU cost, so traced steps are slower than untraced ones. The idle time left with the graph is between steps: picking the token, copying it to the CPU with `.item()` and launching the next replay. The chart shows the current code:
+Traced steps are slower than untraced ones. The idle time left with the graph is between steps: picking the token, `.item()` and launching the next replay. Current code:
 
 ![INT8 decode timeline with and without CUDA graph](benchmark/timeline.svg)
 
 ### 5. Profiling and kernel fusion
 
-Quantizing the output layer cut the bytes read per token 1.82x (~904 MB to ~496 MB) but sped decoding up only 1.21x, so bytes were no longer the main cost.
+Quantizing the output layer cut the bytes read per token 1.82x (~904 MB to ~496 MB) but sped decoding up only 1.21x.
 
-**Bandwidth model.** A decode step must read every weight once, so its floor is bytes read divided by memory bandwidth. The spec says 484 GB/s, but a large device copy reaches ~340 GB/s, so [`bench_bandwidth`](benchmark/bench_bandwidth.py) uses the copy as the reference. It replays one step's graph 200 times, then profiles it and groups every kernel (median of 3, 512-token KV cache, before fusion):
+**Bandwidth model.** [`bench_bandwidth`](benchmark/bench_bandwidth.py) compares step time against bytes read over bandwidth, using a device copy (~340 GB/s) as the reference instead of the 484 GB/s spec. It replays one step's graph 200 times, then profiles it and groups every kernel (median of 3, 512-token KV cache, before fusion):
 
 | | FP32 | INT8 |
 |---|---|---|
@@ -176,7 +172,7 @@ Quantizing the output layer cut the bytes read per token 1.82x (~904 MB to ~496 
 | Weight matmuls (INT8 kernel) | 169 | 1.92 ms | 39% |
 | Attention (QK, softmax, AV) | 72 | 0.74 ms | 15% |
 
-- **Small ops were the biggest cost.** Each took ~2.7 µs, about the fixed cost of any kernel, and they cost the same 2.2 ms in FP32 and INT8, which is why INT8's lead shrank as its matmuls got faster. RMSNorm alone was ~294 kernels (square, mean, add eps, sqrt, divide, scale, for 49 norms) and RoPE ~240.
+- **Small ops were the biggest cost.** ~2.7 µs each, about the launch cost of any kernel, and the same 2.2 ms in FP32 and INT8. RMSNorm alone was ~294 kernels (square, mean, add eps, sqrt, divide, scale, for 49 norms) and RoPE ~240.
 - **The INT8 kernel reached 73% of copy speed**, cuBLAS FP32 91%.
 - At copy speed for its weight reads alone, INT8 would run near 700 tok/s instead of 202.
 
@@ -190,16 +186,16 @@ Quantizing the output layer cut the bytes read per token 1.82x (~904 MB to ~496 
 | down (896x4864) | 15.7 / 279 | 14.58 / 301 |
 | output layer (151936x896) | 386.5 / 354 | 359.18 / 381 |
 
-Before merging, k and v launched only 16 blocks on a GPU with 28 SMs, and q, k, v and o together took 26% of the matmul time for 4% of the bytes. The output layer reads faster than the copy reference: a copy reads and writes every byte, while a matmul mostly reads.
+Before merging, k and v launched only 16 blocks on 28 SMs, and q, k, v and o took 26% of the matmul time for 4% of the bytes. The output layer beats the copy reference because a copy reads and writes every byte, a matmul mostly reads.
 
 **Fusion.** The fixes, in [`fused_ops.cu`](cuda/fused_ops.cu) and [`loader.py`](src/loader.py):
 
-- **Merged projections:** q, k, v stack into one 1152x896 matrix and gate, up into one 9728x896 matrix at load time. Quantization is per row, so the INT8 weights don't change. 4 matmuls per layer instead of 7, and the q/k/v bias is added inside the INT8 kernel instead of by 3 kernels.
-- **Fused residual add + RMSNorm:** one block per row sums squares with warp shuffles and writes the normalized row, plus `x + residual` for the next layer. The layer loop in [`model.py`](src/model.py) carries the sum and its normalized copy, so every residual add joins the norm after it. One kernel instead of up to 8.
-- **Fused RoPE:** q and k now sit side by side in the qkv output, so one kernel rotates both in place. `__fmul_rn`/`__fadd_rn` stop the compiler fusing into FMAs, keeping it bit-identical to PyTorch.
-- **Fused SiLU x up:** one kernel reads both halves of the gate_up output.
+- **Merged projections:** q, k, v into one 1152x896 matrix and gate, up into one 9728x896 matrix at load time (per-row quantization leaves the INT8 weights unchanged). 4 matmuls per layer instead of 7, with the q/k/v bias added inside the INT8 kernel.
+- **Fused residual add + RMSNorm:** one block per row, warp-shuffle reduction, also writes `x + residual` for the next layer. The layer loop in [`model.py`](src/model.py) carries the sum and its normalized copy, so every residual add joins the next norm. One kernel instead of up to 8.
+- **Fused RoPE:** rotates q and k in place in the qkv output. `__fmul_rn`/`__fadd_rn` prevent FMA contraction, keeping it bit-identical to PyTorch.
+- **Fused SiLU x up** on the gate_up output.
 
-Each op in [`layers.py`](src/layers.py) uses its kernel on the GPU and the original PyTorch code otherwise (CPU, or a failed build). Perplexity is unchanged to 4 decimals. Each stage via `bench_bandwidth`, all three versions in alternating rounds, median of 3:
+Each op in [`layers.py`](src/layers.py) falls back to PyTorch on CPU or a failed build. Perplexity is unchanged to 4 decimals. Each stage via `bench_bandwidth`, three versions in alternating rounds, median of 3:
 
 | INT8 decode step | Kernels | Time | Steps/s |
 |---|---|---|---|
@@ -213,13 +209,13 @@ Each op in [`layers.py`](src/layers.py) uses its kernel on the GPU and the origi
 | Small ops | 831 → 224 | 2.26 ms | 0.73 ms |
 | Attention | 72 → 72 | 0.76 ms | 0.79 ms |
 
-FP32 went from 9.431 to 7.607 ms per step with the same changes. In the trace, one layer dropped from 44 kernels in 205 µs to 16 in 109 µs. The weight matmuls are now over half of each step, as they should be in a memory-bound model.
+FP32 went from 9.431 to 7.607 ms per step. In the trace, one layer dropped from 44 kernels in 205 µs to 16 in 109 µs, and weight matmuls are now over half of each step.
 
 ![Decode step before and after kernel fusion](benchmark/fusion.svg)
 
 ### 6. Against the baselines
 
-[`bench_baselines`](benchmark/bench_baselines.py) runs everything on the same chat prompt, 300 greedy tokens, one request, median of 3:
+[`bench_baselines`](benchmark/bench_baselines.py), same chat prompt, 300 greedy tokens, one request, median of 3:
 
 | Setup | tok/s |
 |---|---|
@@ -229,18 +225,16 @@ FP32 went from 9.431 to 7.607 ms per step with the same changes. In the trace, o
 | Hugging Face transformers, FP16 | 72.2 |
 | Hugging Face transformers, FP32 | 71.2 |
 
-- Hugging Face runs at the same speed in FP16 and FP32: at ~14 ms per token the GPU mostly waits on Python, the problem CUDA graphs solve here.
+- Hugging Face is the same speed in FP16 and FP32: at ~14 ms per token it is launch-bound, not memory-bound.
 - llama.cpp is more general and faster at processing prompts. Its Q8_0 format stores an FP16 scale per 32 weights and an untied output matrix.
 
 ## Serving and continuous batching
 
-A FastAPI app streams tokens to a browser chat UI. On a GPU, requests go through a continuous batching engine, with INT8 weights when the kernels build and FP32 otherwise. On CPU, a lock runs them one at a time.
+A FastAPI app streams tokens to a browser chat UI. On a GPU, requests go through [`BatchEngine`](src/batching.py), with INT8 weights when the kernels build and FP32 otherwise. On CPU, a lock runs them one at a time.
 
-Without batching, 8 clients meant the last one waited behind 7 others. [`BatchEngine`](src/batching.py) runs a background thread that owns the GPU and decodes every active request together:
-
-- Each request gets a slot in a preallocated KV cache (8 slots, 2048 tokens each), is prefilled on its own, then joins the batch at the next step. Finished or disconnected requests free their slot right away.
-- Each step is one CUDA graph replay using the same batched `decode_step` as the single-request path. Graphs are captured at startup for 1, 2, 4 and 8 requests, and each step uses the smallest that fits.
-- Each request keeps its own temperature and top-p, since tokens are picked outside the graph.
+- A background thread owns the GPU. Each request gets a slot in a preallocated KV cache (8 slots, 2048 tokens each), is prefilled alone, then joins the batch at the next step. Finished or disconnected requests free their slot immediately.
+- Each step is one CUDA graph replay of the same batched `decode_step` as the single-request path, captured at startup for 1, 2, 4 and 8 requests.
+- Each request keeps its own temperature and top-p.
 
 Combined throughput, 100 greedy tokens per request, median of 3 ([`bench_batching`](benchmark/bench_batching.py)):
 
@@ -253,7 +247,7 @@ Combined throughput, 100 greedy tokens per request, median of 3 ([`bench_batchin
 | INT8 | 4 | 267.1 | 416.3 | 1.56x |
 | INT8 | 8 | 263.9 | **520.5** | 1.98x |
 
-A batch reads each weight once for all its requests, so throughput grows with load. INT8 gains less because each step already reads 4x fewer bytes, but it stays ahead of FP32 at every load (1.68x for one request, 1.10x for eight) with a quarter of the memory. A lone request is 31% slower than the single-request path because it attends over its full 2048-token slot.
+INT8 gains less from batching since each step already reads 4x fewer bytes, but stays ahead of FP32 at every load (1.68x for one request, 1.10x for eight). A lone request is 31% slower than the single-request path because it attends over its full 2048-token slot.
 
 **Load test**, all clients fired at once with `asyncio.gather` ([`bench_app`](benchmark/bench_app.py)), FP32, up to 100 tokens each, median of 3:
 
@@ -263,7 +257,7 @@ A batch reads each weight once for all its requests, so throughput grows with lo
 | 4 | 2.50 s / 2.68 s / 1.49 | 2.00 s / 2.00 s / 2.00 |
 | 8 | 5.01 s / 6.77 s / 1.18 | **2.90 s / 2.91 s / 2.75** |
 
-With batching nobody waits in line, so p50 matches p95. Serving INT8 (before the output layer was quantized) brought 1, 4 and 8 clients to 1.22, 1.81 and 2.78 s p50 (2.87 req/s at 8). Single-client numbers swing between runs (0.47 to 1.54 s) because requests sample at temperature 0.7 and stop at end of sequence, so the token benchmark above is the cleaner comparison.
+Serving INT8 (before the output layer was quantized): 1.22, 1.81 and 2.78 s p50 at 1, 4 and 8 clients (2.87 req/s at 8). Single-client latency varies between runs (0.47 to 1.54 s) because requests sample at temperature 0.7 and stop at end of sequence.
 
 On CPU (50-token replies), one request at a time:
 
@@ -275,9 +269,9 @@ On CPU (50-token replies), one request at a time:
 
 ## What's left
 
-- **Attention** is now 24% of a step: cuBLAS batched matmuls and a separate softmax per layer, over the whole preallocated cache. A fused decode attention kernel would also fix the slow lone request in the batch engine.
-- **o and down** use only 112 blocks on 28 SMs and run at 163 to 301 GB/s.
-- **The gap between steps** (~0.3 to 0.5 ms per token): picking the token on the CPU with `.item()` before the next replay.
+- **Attention** is 24% of a step: cuBLAS batched matmuls and a separate softmax per layer over the whole preallocated cache. A fused decode attention kernel would also fix the slow lone request in the batch engine.
+- **o and down** use only 112 blocks on 28 SMs (163 to 301 GB/s).
+- **The gap between steps** (~0.3 to 0.5 ms per token) from picking the token on the CPU with `.item()`.
 - **Speculative decoding** with prompt lookup.
 
 ## Usage
@@ -349,7 +343,7 @@ Run any of these with `python -m <name>`:
 | `benchmark.bench_baselines [llama-bench.exe model.gguf]` | Hugging Face, llama.cpp and this engine, draws `baselines.svg` |
 | `benchmark.profile_trace` + `analyze_trace` | nvprof timeline, per-projection table, `timeline.svg` and `fusion.svg` |
 
-**Kernel timeline with nvprof** (ships with CUDA 12.6, supports Pascal). nvprof must launch the real interpreter, not the venv launcher, so the venv goes through `PYTHONPATH`:
+**Kernel timeline with nvprof** (ships with CUDA 12.6, supports Pascal). nvprof must launch the base interpreter, so the venv goes through `PYTHONPATH`:
 
 ```powershell
 $env:PATH = "$env:CUDA_PATH\extras\CUPTI\lib64;$env:PATH"

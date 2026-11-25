@@ -10,3 +10,4 @@ gutenberg.txt
 trace.json
 benchmark/trace_*.csv
 *.nsys-rep
+.DS_Store

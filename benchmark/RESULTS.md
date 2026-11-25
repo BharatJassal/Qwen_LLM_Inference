@@ -1,5 +1,18 @@
 # Results log (GTX 1080 Ti, Windows 11, PyTorch cu126, CUDA 12.6, VS 2022 Build Tools)
 
+## Reproducing the nvprof timeline
+
+nvprof ships with CUDA 12.6 and supports Pascal (Nsight Compute does not, and nsys and nvprof counters need admin rights here). It has to launch the real interpreter rather than the venv launcher, so the venv goes through `PYTHONPATH`:
+
+```powershell
+$env:PATH = "$env:CUDA_PATH\extras\CUPTI\lib64;$env:PATH"
+$env:PYTHONPATH = "$PWD;$PWD\.venv\Lib\site-packages"
+$py = (python -c "import sys; print(sys._base_executable)")
+foreach ($m in "cached", "graph") { nvprof --profile-from-start off --print-gpu-trace --csv -u us --log-file benchmark/trace_$m.csv $py -m benchmark.profile_trace $m }
+python -m benchmark.analyze_trace                          # timeline.svg
+python -m benchmark.analyze_trace path/to/old/trace_graph.csv   # also fusion.svg, old vs current
+```
+
 ## Correctness on GPU
 - test_HF: logits max abs diff 3.86e-05, attention 5.96e-07, MLP 2.19e-05 (all pass, gate 1e-3)
 - test_gate2: 500 tokens, cached == uncached token for token. Naive 59.34 s, cached 9.79 s
@@ -271,3 +284,20 @@ Before the batched kernel, the INT8 engine would fall back to dequantize for bat
 - bench_int8_batch on merged shapes, 3 runs, µs (kernel / dequantize / cuBLAS), median: gate_up b1 28.71 / 436.24 / 97.57, b8 112.96 / 493.58 / 156.30; down b1 15.91 / 231.00 / 52.55, b8 51.98 / 282.59 / 103.99; qkv b1 9.31 / 64.15 / 15.80, b8 20.53 / 74.49 / 24.97. Raw kernel gate_up b1: 30.03 28.68 28.71
 - nvprof trace after fusion: without graph 15.09 ms per step, 84% idle, 490 kernels; with graph 3.16 ms, 11% idle, 397 kernels. Layer 12: 586 us / 109 us. Before fusion (graph trace of A): 5.61 ms, 1076 kernels, layer 12 205 us with 44 kernels; after: layer 12 109 us with 16 kernels
 - Per projection after merging, us / GB/s: qkv 5.50 / 189, o 4.96 / 163, gate_up 28.00 / 313, down 14.58 / 301, output 359.18 / 381. The output layer beats the 338 GB/s measured copy: a copy reads and writes, the matmul mostly reads, so the copy is a reference, not a ceiling
+
+## Baselines vs Hugging Face and llama.cpp (2026-11-24)
+
+bench_baselines: "Write a story about the ocean." chat prompt, 300 new tokens, greedy, one request, median of 3 runs per round. Hugging Face transformers `generate` with `min_new_tokens=300`, default attention. llama.cpp b12686 official Windows CUDA 12.4 build, `llama-bench -ngl 99 -p 0 -n 300 -fa 1`, Qwen's own qwen2.5-0.5b-instruct-q8_0.gguf (638.74 MiB). Other apps held the GPU at ~9% while idle.
+
+| tok/s | round 1 | round 2 |
+|---|---|---|
+| HF FP32 | 68.0 | 71.2 |
+| HF FP16 | 72.2 | 72.2 |
+| this engine FP32 (graph) | 131.0 | 130.4 |
+| this engine INT8 (graph) | 286.0 | 285.1 |
+| llama.cpp Q8_0 | 197.0 | 198.4 |
+
+- Earlier standalone runs while the GPU was busier: llama.cpp tg300 160.6 / 168.3 with flash attention off, 169.2 / 170.6 on; engine INT8 256.6 / 264.9 / 286.1. The chart uses round 2.
+- HF FP16 is no faster than FP32: at ~14 ms per token the GPU mostly waits on Python, so halving the bytes changes nothing. Pascal also runs FP16 math at 1/64 rate.
+- llama-bench with 32 tokens instead of 300 gives 204 tok/s: attention over a longer context costs more per token.
+- llama.cpp was not profiled, so the gap is measured, not explained. Q8_0 stores an FP16 scale per 32 weights (8.5 bits per weight) and an untied output matrix; this engine uses one scale per row.
